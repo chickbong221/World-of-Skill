@@ -1,0 +1,13 @@
+.pytest_cache
+dist
+__pycache__/
+*.py[cod]
+*.egg-info
+MUJOCO_LOG.TXT
+wandb/
+~/
+data/
+CompoSuite/
+offline-compositional-rl-datasets/
+logdir/
+;
