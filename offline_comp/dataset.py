@@ -31,6 +31,7 @@ class OfflineCompDataset:
     self._task_position = 0
     self._task_batch_count = 0
     self._task_order = []
+    self._closed = False
 
     import h5py
     with _H5_LOCK:
@@ -84,8 +85,14 @@ class OfflineCompDataset:
 
   def close(self):
     with _H5_LOCK:
+      if self._closed:
+        return
+      self._closed = True
       for handle in self.files:
-        handle.close()
+        try:
+          handle.close()
+        except Exception:
+          pass
 
   @property
   def obs_space(self):
@@ -177,6 +184,8 @@ class OfflineCompDataset:
     stop = start + self.sequence_length
 
     with _H5_LOCK:
+      if self._closed:
+        raise StopIteration
       obs = np.asarray(handle["observations"][start:stop], np.float32)
       action = np.asarray(handle["actions"][start:stop], np.float32)
       raw_reward = np.asarray(

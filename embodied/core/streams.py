@@ -71,7 +71,10 @@ class Prefetch(base.Stream):
     try:
       while True:
         self.requests.acquire()
-        data = next(self.source)
+        try:
+          data = next(self.source)
+        except StopIteration:
+          return
         data = self.transform(data)
         state = self._getstate()
         self.queue.put((data, state))
