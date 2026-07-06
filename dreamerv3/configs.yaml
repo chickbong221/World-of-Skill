@@ -259,7 +259,7 @@ offline_comp:
     log_every: 20000       # ~10 batches per log
     report_every: 200000   # ~100 batches per report
     eval_every: 1000000    # ~500 batches per eval (~10 evals across the run)
-    env_eval_every: 10000000      # transitions between env rollouts; 0 disables
+    env_eval_every: 1000000      # transitions between env rollouts; 0 disables
     env_eval_episodes: 10   # episodes per task per env-eval
     env_eval_horizon: 500  # max env steps per episode
     env_eval_max_tasks: 0  # cap tasks evaluated per split; 0 = all
