@@ -254,7 +254,7 @@ offline_comp:
   batch_length: 64
   replay_context: 0
   run:
-    steps: 10e7
+    steps: 1e7
     clock: step
     log_every: 20000       # ~10 batches per log
     report_every: 200000   # ~100 batches per report
