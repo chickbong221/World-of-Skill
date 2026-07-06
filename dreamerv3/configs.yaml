@@ -247,10 +247,10 @@ debug:
     .*\.depth: 2
 
 offline_comp:
-  <<: *size100m
+  <<: *size25m
   task: offline_comp
   script: train_offline
-  batch_size: 128
+  batch_size: 32
   batch_length: 64
   replay_context: 0
   run:
