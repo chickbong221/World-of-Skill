@@ -19,6 +19,7 @@ import portal
 import ruamel.yaml as yaml
 
 def main(argv=None):
+  print(f"folder: {folder}")
   configs = elements.Path(folder / 'configs.yaml').read()
   configs = yaml.YAML(typ='safe').load(configs)
   parsed, other = elements.Flags(configs=['defaults']).parse_known(argv)
