@@ -68,8 +68,8 @@ Overrides:
 ```bash
 python dreamerv3/main.py --configs offline_comp \
   --data.root data/expert-panda-offline-comp-data \
-  --data.train.tasks "[Panda_Box_None_Push, Panda_Plate_ObjectWall_Shelf]" \
-  --data.test.tasks "[Panda_Dumbbell_ObjectDoor_Trashcan]"
+  --data.train.tasks Panda_Box_None_Push,Panda_Plate_ObjectWall_Shelf \
+  --data.test.tasks Panda_Dumbbell_ObjectDoor_Trashcan
 ```
 
 ## Task Sampling
