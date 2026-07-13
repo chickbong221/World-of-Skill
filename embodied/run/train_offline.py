@@ -27,7 +27,7 @@ def _run_env_eval(agent, tasks, episodes, horizon, max_tasks):
         task.robot, task.obj, task.obstacle, task.objective,
         horizon=horizon)
     try:
-      returns, once, ends = _rollout(agent, env, episodes)
+      returns, once, ends = _rollout(agent, env, episodes, task)
     finally:
       env.close()
     per_task[task.name] = {
@@ -51,7 +51,7 @@ def _run_env_eval(agent, tasks, episodes, horizon, max_tasks):
   return metrics
 
 
-def _rollout(agent, env, episodes):
+def _rollout(agent, env, episodes, task=None):
   """Run `episodes` episodes in `env` under `agent.policy(mode='eval')`."""
   carry = agent.init_policy(1)
   action_shape = env.act_space['action'].shape
@@ -60,6 +60,26 @@ def _rollout(agent, env, episodes):
       'reset': True,
   }
   obs = env.step(reset_action)
+  # MoSS: agent.policy() asserts obs.keys() == obs_space.keys(), and
+  # obs_space now carries task ids. The policy does not consume them (they
+  # are excluded from the encoder); they only need to be present and finite.
+  extra = {}
+  if getattr(agent, 'obs_space', None) and 'task_id' in agent.obs_space:
+    from offline_comp import tasks as tasks_mod
+    tid = 0
+    axes = np.zeros((4,), np.int32)
+    if task is not None:
+      axes = np.array([
+          tasks_mod.ROBOTS.index(task.robot),
+          tasks_mod.OBJECTS.index(task.obj),
+          tasks_mod.OBSTACLES.index(task.obstacle),
+          tasks_mod.OBJECTIVES.index(task.objective),
+      ], np.int32)
+    extra = {
+        'task_id': np.asarray(tid, np.int32)[None],
+        'task_axes': axes[None],
+    }
+
   returns, once, ends = [], [], []
   ep_return = 0.0
   ep_success_once = False
@@ -72,6 +92,7 @@ def _rollout(agent, env, episodes):
     policy_obs = {
         k: np.asarray(v)[None] for k, v in obs.items()
         if not k.startswith('log/')}
+    policy_obs.update(extra)
     carry, acts, _ = agent.policy(carry, policy_obs, mode='eval')
     act = {k: np.asarray(v)[0] for k, v in acts.items()}
     act['reset'] = False

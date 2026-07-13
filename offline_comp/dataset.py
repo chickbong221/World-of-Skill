@@ -6,6 +6,7 @@ import elements
 import numpy as np
 
 from . import selection
+from . import tasks as tasks_mod
 
 
 _H5_LOCK = threading.Lock()
@@ -102,6 +103,10 @@ class OfflineCompDataset:
         "is_first": elements.Space(bool),
         "is_last": elements.Space(bool),
         "is_terminal": elements.Space(bool),
+        # MoSS: environment index for per-environment responsibility, plus
+        # the CompoSuite (robot, object, obstacle, objective) component ids.
+        "task_id": elements.Space(np.int32, (), 0, max(len(self.tasks), 1)),
+        "task_axes": elements.Space(np.int32, (4,), 0, 4),
     }
 
   @property
@@ -178,6 +183,13 @@ class OfflineCompDataset:
   def _sample_one(self, task_index=None):
     if task_index is None:
       task_index = self._choose_task()
+    task = self.tasks[task_index]
+    axes = np.array([
+        tasks_mod.ROBOTS.index(task.robot),
+        tasks_mod.OBJECTS.index(task.obj),
+        tasks_mod.OBSTACLES.index(task.obstacle),
+        tasks_mod.OBJECTIVES.index(task.objective),
+    ], np.int32)
     handle = self.files[task_index]
     length = self.lengths[task_index]
     start = int(self.rng.integers(0, length - self.sequence_length + 1))
@@ -222,6 +234,8 @@ class OfflineCompDataset:
         "is_terminal": is_terminal,
         "stepid": stepid,
         "consec": np.zeros((self.sequence_length,), np.int32),
+        "task_id": np.full((self.sequence_length,), task_index, np.int32),
+        "task_axes": np.tile(axes, (self.sequence_length, 1)),
     }
 
 
