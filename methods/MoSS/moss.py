@@ -42,6 +42,30 @@ i32 = jnp.int32
 sg = jax.lax.stop_gradient
 
 
+# Single source of truth for the MoSS loss keys and their default scales.
+# `Agent.loss` asserts set(losses) == set(scales) exactly, so these MUST stay in
+# sync with the keys written into `losses` in MoSSRSSM.loss.
+DEFAULT_SCALES = dict(
+    mexp=0.5,     # per-expert prior KL (every active expert must explain z_t)
+    msub=1.0,     # transition-level subset invariance (MMD)
+    mdiv=0.01,    # expert diversity
+    msp=0.001,    # router entropy (confident routing)
+    mbal=0.01,    # load balancing
+    mrew=1.0,     # per-expert reward head   (only if expert_heads)
+    mcon=1.0,     # per-expert continuation head (only if expert_heads)
+)
+
+
+def loss_scales(config_scales=None, expert_heads=True):
+  """Return the exact set of MoSS loss scales, defaults filled in."""
+  scales = dict(DEFAULT_SCALES)
+  scales.update(dict(config_scales or {}))
+  if not expert_heads:
+    scales.pop('mrew', None)
+    scales.pop('mcon', None)
+  return scales
+
+
 class MoSSRSSM(nj.Module):
 
   # --- Backbone (mirrors rssm.RSSM) ---

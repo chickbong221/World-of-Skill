@@ -91,10 +91,12 @@ class Agent(embodied.jax.Agent):
       scales['policy'] *= offline.get('imag_policy_scale', 1.0)
       scales['bc_policy'] = offline.get('bc_scale', 1.0)
     if self.ismoss:
-      scales.update(dict(config.moss_scales))
-      if not config.dyn.moss.expert_heads:
-        scales.pop('mrew', None)
-        scales.pop('mcon', None)
+      # moss.DEFAULT_SCALES is the source of truth; config only overrides.
+      # This makes a missing/partial `moss_scales:` block a no-op rather than
+      # an assertion failure in Agent.loss.
+      scales.update(moss.loss_scales(
+          config.get('moss_scales', {}),
+          expert_heads=config.dyn.moss.expert_heads))
     self.scales = scales
 
   @property
