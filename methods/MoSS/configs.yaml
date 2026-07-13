@@ -1,3 +1,20 @@
+# DreamerV3 world model + MoSS (mixture-of-skills) extension.
+#
+# Two dynamics backbones live side-by-side under `agent.dyn`:
+#   rssm — vanilla DreamerV3 recurrent state-space model
+#   moss — MoSS variant (see methods/MoSS/moss.py)
+# Flip between them with `--agent.dyn.typ {rssm|moss}` or the named
+# `offline_comp_moss` preset below.
+#
+# NOTE ON THE `moss:` BLOCK. The fields below mirror `rssm:` plus one
+# extra key that agent.py explicitly reads (`expert_heads`). If your
+# MoSSRSSM.__init__ signature has extra kwargs (num_experts,
+# gate_temperature, task_embed_dim, load_balance_scale, ...), add them
+# here so `**config.dyn.moss` passes them through. Any kwarg present in
+# the block but missing from __init__ will raise "unexpected keyword
+# argument". Any kwarg __init__ requires but missing here will raise
+# "missing positional argument". Keep them in sync.
+
 defaults:
 
   logdir: ./logdir/{timestamp}
@@ -54,7 +71,7 @@ defaults:
     steps: 1e10
     duration: 0
     train_ratio: 32.0
-    clock: time   # 'time' → wall-clock seconds (LocalClock); 'step' → step count (StepClock). Applies to log/report/eval; save is always time-based.
+    clock: time
     log_every: 120
     report_every: 300
     save_every: 900
@@ -101,8 +118,10 @@ defaults:
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
     dyn:
-      typ: rssm
-      rssm: { deter: 8192, hidden: 1024, ... }   # keep as-is for fallback
+      typ: rssm       # switch to `moss` via preset or --agent.dyn.typ moss
+      rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
+      # MoSS block. Fields mirror rssm plus MoSS-specific keys. Adjust
+      # the MoSS-specific keys to match your moss.MoSSRSSM.__init__.
       moss:
         deter: 8192
         hidden: 1024
@@ -116,14 +135,15 @@ defaults:
         imglayers: 2
         obslayers: 1
         dynlayers: 1
+        absolute: False
         blocks: 8
         free_nats: 1.0
-        expert_heads: true          # required by the agent code
-        # + any MoSS-specific fields (num_experts, gating, task embedding dim, ...)
+        expert_heads: true      # required by agent.py; toggles per-expert rew/con
+    # Loss scales for the MoSS-specific heads. Only used when dyn.typ == 'moss'.
+    # `mrew` and `mcon` are dropped automatically when expert_heads is false.
     moss_scales:
-      mrew: 1.0    # only used if expert_heads: true
-      mcon: 1.0    # only used if expert_heads: true
-      # + any other MoSS-specific losses (gating entropy, load balancing, ...)
+      mrew: 1.0
+      mcon: 1.0
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
@@ -165,38 +185,50 @@ defaults:
     train: {tasks: [Panda_Box_None_PickPlace]}
     test: {tasks: [Panda_Box_None_PickPlace]}
 
+# Size presets update BOTH backbones so you can flip typ without resizing.
+# Every pattern must match at least one existing key in the config, so the
+# `moss:` block above must contain deter/hidden/classes for the .*\.moss
+# pattern to succeed.
+
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
+  .*\.moss: {deter: 512, hidden: 64, classes: 4}
   .*\.depth: 4
   .*\.units: 64
 
 size12m: &size12m
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
+  .*\.moss: {deter: 2048, hidden: 256, classes: 16}
   .*\.depth: 16
   .*\.units: 256
 
 size25m: &size25m
   .*\.rssm: {deter: 3072, hidden: 384, classes: 24}
+  .*\.moss: {deter: 3072, hidden: 384, classes: 24}
   .*\.depth: 24
   .*\.units: 384
 
 size50m: &size50m
   .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
+  .*\.moss: {deter: 4096, hidden: 512, classes: 32}
   .*\.depth: 32
   .*\.units: 512
 
 size100m: &size100m
   .*\.rssm: {deter: 6144, hidden: 768, classes: 48}
+  .*\.moss: {deter: 6144, hidden: 768, classes: 48}
   .*\.depth: 48
   .*\.units: 768
 
 size200m: &size200m
   .*\.rssm: {deter: 8192, hidden: 1024, classes: 64}
+  .*\.moss: {deter: 8192, hidden: 1024, classes: 64}
   .*\.depth: 64
   .*\.units: 1024
 
 size400m: &size400m
   .*\.rssm: {deter: 12288, hidden: 1536, classes: 96}
+  .*\.moss: {deter: 12288, hidden: 1536, classes: 96}
   .*\.depth: 96
   .*\.units: 1536
 
@@ -267,6 +299,10 @@ debug:
     .*\.blocks: 4
     .*\.depth: 2
 
+# Offline CompoSuite recombination test with vanilla RSSM.
+# Train on 13 of 16 obj × obstacle combos (Panda × PickPlace fixed),
+# hold out 3. Every object and every obstacle still appears in >=3 train
+# tasks, so test failures isolate "unseen combinations of seen components".
 offline_comp:
   <<: *size25m
   task: offline_comp
@@ -277,19 +313,19 @@ offline_comp:
   run:
     steps: 1e7
     clock: step
-    log_every: 20000       # ~10 batches per log
-    report_every: 200000   # ~100 batches per report
-    eval_every: 1000000    # ~500 batches per eval (~10 evals across the run)
-    env_eval_every: 1000000      # transitions between env rollouts; 0 disables
-    env_eval_episodes: 10   # episodes per task per env-eval
-    env_eval_horizon: 500  # max env steps per episode
-    env_eval_max_tasks: 0  # cap tasks evaluated per split; 0 = all
+    log_every: 20000
+    report_every: 200000
+    eval_every: 1000000
+    env_eval_every: 1000000
+    env_eval_episodes: 10
+    env_eval_horizon: 500
+    env_eval_max_tasks: 0
     from_checkpoint: ''
   logger:
     outputs: [jsonl, wandb]
-    wandb_project: offline-comp-dreamer
-    wandb_group: composuite
-    wandb_name: dreamer-offline-comp
+    wandb_project: offline-comp
+    wandb_group: composuite-rssm
+    wandb_name: rssm-offline-comp
   jax:
     prealloc: false
   agent:
@@ -306,11 +342,6 @@ offline_comp:
       eval_schedule: mixed
       batches_per_task: 1000
       shuffle_tasks: false
-    # Recombination test: fix Panda × PickPlace, train on 13 of 16 obj×obstacle
-    # combos, hold out 3. Every obj and every obstacle still appears in >=3
-    # train tasks, so failures on test isolate "unseen combination of seen
-    # components". Tasks are underscore-joined strings because elements.Config
-    # rejects nested lists; parse_task_name() splits them back into 4-tuples.
     train:
       tasks:
         - Panda_Box_None_PickPlace
@@ -332,21 +363,17 @@ offline_comp:
         - Panda_Plate_GoalWall_PickPlace
         - Panda_Hollowbox_ObjectWall_PickPlace
 
+# MoSS variant of the offline recombination test.
+# Only flips dyn.typ and logging identifiers; everything else inherits
+# from offline_comp when stacked as `--configs offline_comp offline_comp_moss`.
+# The `<<: *size25m` on offline_comp already sized both rssm and moss blocks,
+# so we deliberately DO NOT re-apply a size preset here.
 offline_comp_moss:
-  task: offline_comp
-  script: train_offline
-  batch_size: 32
-  batch_length: 64
-  replay_context: 0
   agent:
     dyn:
       typ: moss
-    dyn.moss.expert_heads: true
-    # any overrides
   logger:
     outputs: [jsonl, wandb]
-    wandb_project: offline-comp-dreamer
+    wandb_project: offline-comp-moss
     wandb_group: composuite-moss
-    wandb_name: dreamer-offline-comp-moss
-  # (copy the rest of offline_comp's data/run/jax sections here,
-  #  or just launch with --configs offline_comp offline_comp_moss)
+    wandb_name: moss-offline-comp
