@@ -311,27 +311,27 @@ offline_comp:
   batch_length: 64
   replay_context: 0
   run:
-    steps: 1e7
+    steps: 1e9
     clock: step
-    log_every: 20000
-    report_every: 200000
-    eval_every: 1000000
-    env_eval_every: 1000000
-    env_eval_episodes: 10
-    env_eval_horizon: 500
-    env_eval_max_tasks: 0
+    log_every: 100000       # ~10 batches per log
+    report_every: 1000000   # ~100 batches per report
+    eval_every: 2000000    # ~500 batches per eval (~10 evals across the run)
+    env_eval_every: 2000000      # transitions between env rollouts; 0 disables
+    env_eval_episodes: 10   # episodes per task per env-eval
+    env_eval_horizon: 500  # max env steps per episode
+    env_eval_max_tasks: 0  # cap tasks evaluated per split; 0 = all
     from_checkpoint: ''
   logger:
     outputs: [jsonl, wandb]
-    wandb_project: offline-comp
-    wandb_group: composuite-rssm
-    wandb_name: rssm-offline-comp
+    wandb_project: offline-comp-dreamer
+    wandb_group: composuite
+    wandb_name: dreamer-offline-comp
   jax:
     prealloc: false
   agent:
     offline:
       enabled: true
-      bc_scale: 0.1
+      bc_scale: 0.5
       imag_policy_scale: 1.0
   data:
     root: data/expert-panda-offline-comp-data
