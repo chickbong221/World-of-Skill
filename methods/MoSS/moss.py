@@ -148,6 +148,10 @@ class MoSSRSSM(nj.Module):
           pi=ex['pi'], pitilde=ex['pitilde'], delta=ex['delta'],
           zexp=ex['zexp'], sig=ex['sig'],
           klexp=jnp.zeros(ex['pi'].shape, ex['pi'].dtype)))
+      if self.expert_heads:
+        # Key set MUST match _observe: the agent tree-concats repfeat+imgfeat.
+        feat['rexp'] = ex['rexp']
+        feat['cexp'] = ex['cexp']
       return carry, (feat, action)
     unroll = length if self.unroll else 1
     if callable(policy):
@@ -193,6 +197,9 @@ class MoSSRSSM(nj.Module):
         deter=deter, stoch=stoch, logit=logit,
         pi=ex['pi'], pitilde=ex['pitilde'], delta=ex['delta'],
         zexp=ex['zexp'], sig=ex['sig'], klexp=nn.cast(klexp))
+    if self.expert_heads:
+      feat['rexp'] = ex['rexp']
+      feat['cexp'] = ex['cexp']
     entry = dict(deter=deter, stoch=stoch)
     return carry, (entry, feat)
 
