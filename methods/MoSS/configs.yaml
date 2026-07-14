@@ -144,11 +144,11 @@ defaults:
     moss_scales:
       mrew: 1.0
       mcon: 1.0
-      mdiv: 0
-      msub: 0
-      mbal: 0
-      msp: 0
-      mexp: 0
+      mdiv: 1000
+      msub: 1.0
+      mbal: 0.003
+      msp: 1.0
+      mexp: 0.1
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
