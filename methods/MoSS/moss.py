@@ -69,8 +69,24 @@ def loss_scales(config_scales=None, expert_heads=True):
 class MoSSRSSM(nj.Module):
 
   # --- Backbone (mirrors rssm.RSSM) ---
-  deter: int = 1024          # keep modest: experts replicate the recurrent core
-  hidden: int = 512
+  # deter: int = 1024          # keep modest: experts replicate the recurrent core
+  # hidden: int = 512
+  # stoch: int = 32
+  # classes: int = 32
+  # norm: str = 'rms'
+  # act: str = 'gelu'
+  # unroll: bool = False
+  # unimix: float = 0.01
+  # outscale: float = 1.0
+  # imglayers: int = 2
+  # obslayers: int = 1
+  # dynlayers: int = 1
+  # absolute: bool = False
+  # blocks: int = 8
+  # free_nats: float = 1.0
+
+  deter: int = 4096
+  hidden: int = 2048
   stoch: int = 32
   classes: int = 32
   norm: str = 'rms'
@@ -282,10 +298,12 @@ class MoSSRSSM(nj.Module):
         h = nn.act(self.act)(
             self.sub(f'e{m}hid{i}norm', nn.Norm, self.norm)(h))
       h = self.sub(f'e{m}gru', nn.BlockLinear, 3 * self.deter, g, **self.kw)(h)
+
       reset, cand, update = [group2flat(y) for y in jnp.split(flat2group(h), 3, -1)]
       reset = jax.nn.sigmoid(reset)
       cand = jnp.tanh(reset * cand)
       update = jax.nn.sigmoid(update - 1)
+
       deters.append(update * cand + (1 - update) * deter)
 
     stacked = jnp.stack(deters, -2)                    # (..., M, deter)

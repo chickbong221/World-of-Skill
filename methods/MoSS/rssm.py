@@ -145,16 +145,20 @@ class RSSM(nj.Module):
     x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
     x2 = nn.act(self.act)(self.sub('dynin2norm', nn.Norm, self.norm)(x2))
     x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+
     x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+
     for i in range(self.dynlayers):
       x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))
     x = self.sub('dyngru', nn.BlockLinear, 3 * self.deter, g, **self.kw)(x)
+
     gates = jnp.split(flat2group(x), 3, -1)
     reset, cand, update = [group2flat(x) for x in gates]
     reset = jax.nn.sigmoid(reset)
     cand = jnp.tanh(reset * cand)
     update = jax.nn.sigmoid(update - 1)
+
     deter = update * cand + (1 - update) * deter
     return deter
 
