@@ -30,6 +30,9 @@ def main(argv=None):
   config = config.update(logdir=os.path.expanduser(
       config.logdir.format(timestamp=elements.timestamp())))
 
+  print('moss_scales:', dict(config.agent.moss_scales))
+  print('dyn.typ:', config.agent.dyn.typ)
+
   if 'JOB_COMPLETION_INDEX' in os.environ:
     config = config.update(replica=int(os.environ['JOB_COMPLETION_INDEX']))
   print('Replica:', config.replica, '/', config.replicas)
