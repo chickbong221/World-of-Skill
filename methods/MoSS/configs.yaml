@@ -138,7 +138,10 @@ defaults:
         absolute: False
         blocks: 8
         free_nats: 1.0
-        expert_heads: true      # required by agent.py; toggles per-expert rew/con
+        expert_heads: true
+        experts: 8      # M — number of expert branches
+        topk: 2         # k — experts activated per step
+        zdim: 128       # expert internal representation dim
     # Loss scales for the MoSS-specific heads. Only used when dyn.typ == 'moss'.
     # `mrew` and `mcon` are dropped automatically when expert_heads is false.
     moss_scales:
