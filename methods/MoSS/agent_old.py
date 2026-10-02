@@ -45,15 +45,10 @@ class Agent(embodied.jax.Agent):
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
-    dynkw = dict(config.dyn[config.dyn.typ])
-    if config.dyn.typ == 'moss' and 'task_id' in obs_space:
-      # Size the (K, M) responsibility tables from the data. With K too small,
-      # one_hot maps out-of-range task ids to zeros and silently drops them.
-      dynkw['num_envs'] = int(obs_space['task_id'].classes)
     self.dyn = {
         'rssm': rssm.RSSM,
         'moss': moss.MoSSRSSM,
-    }[config.dyn.typ](act_space, **dynkw, name='dyn')
+    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.ismoss = (config.dyn.typ == 'moss')
     self.dec = {
         'simple': rssm.Decoder,
@@ -233,18 +228,9 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
-    rew_img = self.rew(inp, 2).pred()
-    if self.ismoss and self.dyn.beta_unc > 0:
-      # Offline uncertainty penalty (paper Eq. 28): hinge on co-active expert
-      # disagreement, normalised per environment of the rollout's start state.
-      env0 = obs['task_id'][:, -K:].reshape(B * K)
-      pen = self.dyn.unc_penalty(imgfeat['dis'], env0)
-      rew_img = rew_img - sg(pen)
-      metrics['moss_unc_pen'] = pen.mean()
-      metrics['moss_unc_frac'] = (pen > 0).astype(f32).mean()
     los, imgloss_out, mets = imag_loss(
         imgact,
-        rew_img,
+        self.rew(inp, 2).pred(),
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
