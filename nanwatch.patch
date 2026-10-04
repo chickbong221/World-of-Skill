@@ -1,0 +1,631 @@
+diff --git a/embodied/jax/opt.py b/embodied/jax/opt.py
+index d11b146..dd3e8fd 100644
+--- a/embodied/jax/opt.py
++++ b/embodied/jax/opt.py
+@@ -1,4 +1,5 @@
+ import math
++import re
+ 
+ import jax
+ import jax.numpy as jnp
+@@ -16,8 +17,12 @@ sg = jax.lax.stop_gradient
+ class Optimizer(nj.Module):
+ 
+   summary_depth: int = 2
++  nanguard: str = 'off'   # 'off' | 'skip' (skip bad steps) | 'freeze' (skip, then
++                          # freeze all later updates so the state stays replayable)
++  diag: bool = False      # per-module gradient norms / non-finite counts
+ 
+   def __init__(self, modules, opt):
++    assert self.nanguard in ('off', 'skip', 'freeze'), self.nanguard
+     modules = modules if isinstance(modules, (list, tuple)) else (modules,)
+     self.modules = modules
+     self.opt = opt
+@@ -27,6 +32,8 @@ class Optimizer(nj.Module):
+       self.opt = optax.apply_if_finite(self.opt, max_consecutive_errors=1000)
+       self.grad_scale = nj.Variable(jnp.array, 1e4, f32, name='grad_scale')
+       self.good_steps = nj.Variable(jnp.array, 0, i32, name='good_steps')
++    if self.nanguard == 'freeze':
++      self.frozen = nj.Variable(jnp.array, 0, i32, name='frozen')
+ 
+   def __call__(self, lossfn, *args, has_aux=False, **kwargs):
+     metrics = {}
+@@ -40,6 +47,11 @@ class Optimizer(nj.Module):
+         loss *= sg(self.grad_scale.read())
+       return loss, aux
+ 
++    # Snapshot module state BEFORE the forward pass (it also writes running
++    # statistics), so a bad step can be undone exactly.
++    pre = None if nj.creating() else dict(nj.context())
++    if self.nanguard == 'freeze':
++      self.frozen.read()          # ninjax creates variables lazily on first read
+     loss, params, grads, aux = nj.grad(
+         lossfn2, self.modules, has_aux=True)(*args, **kwargs)
+     if self.scaling:
+@@ -59,9 +71,25 @@ class Optimizer(nj.Module):
+ 
+     state = self.sub('state', nj.Tree, self.opt.init, params)
+     updates, new_state = self.opt.update(grads, state.read(), params)
+-    nj.context().update(optax.apply_updates(params, updates))
+-    state.write(new_state)
++    new_params = optax.apply_updates(params, updates)
+     grad_norm = optax.global_norm(grads)
++    guard = self.nanguard != 'off' and pre is not None
++    old = {k: pre.get(k, v) for k, v in params.items()} if guard else params
++    if guard:
++      ok = jnp.isfinite(grad_norm) & jnp.isfinite(loss)
++      if self.nanguard == 'freeze':
++        ok = ok & (self.frozen.read() == 0)
++      keep = lambda n, o: jnp.where(ok, n, o)
++      new_params = jax.tree.map(keep, new_params, old)
++      new_state = jax.tree.map(keep, new_state, state.read())
++      if self.nanguard == 'freeze':
++        self.frozen.write(jnp.where(ok, self.frozen.read(), 1))
++        metrics['frozen'] = f32(self.frozen.read())
++      metrics['skipped'] = f32(~ok)
++    nj.context().update(new_params)
++    state.write(new_state)
++    if self.diag:
++      metrics.update(_diagnose(grads, old))
+     if self.scaling:
+       self._update_scale(grads, jnp.isfinite(grad_norm))
+       grad_norm = jnp.where(jnp.isfinite(grad_norm), grad_norm, jnp.nan)
+@@ -69,7 +97,7 @@ class Optimizer(nj.Module):
+       metrics['grad_scale'] = self.grad_scale.read()
+       metrics['grad_overflow'] = f32(~jnp.isfinite(grad_norm))
+     else:
+-      self.step.write(self.step.read() + 1)
++      self.step.write(self.step.read() + (i32(ok) if guard else 1))
+     metrics['loss'] = loss.mean()
+     metrics['updates'] = self.step.read()
+     metrics['grad_norm'] = grad_norm
+@@ -162,3 +190,43 @@ def scale_by_momentum(beta=0.9, nesterov=False):
+     return mu_hat, (step, mu)
+ 
+   return optax.GradientTransformation(init_fn, update_fn)
++
++
++_EXPERT = re.compile(r'^e(\d+)(in|innorm|hid\d+|hid\d+norm|gru)$')
++_STATS = ('q_ema', 'l_ema', 'count', 'eseen', 'dbar', 'step')
++_ALIAS = {'priorlogit': 'prior', 'obslogit': 'obs', 'rlogit': 'router',
++          'rnoise': 'router', 'dynin': 'stem'}
++
++
++def _group(key):
++  """'dyn/e3gru/kernel' -> 'dyn/e3', 'dyn/prior0norm/scale' -> 'dyn/prior'."""
++  parts = key.split('/')
++  if parts[0] != 'dyn' or len(parts) < 3:
++    return parts[0]
++  sub = parts[1]
++  m = _EXPERT.match(sub)
++  if m:
++    return f'dyn/e{m.group(1)}'
++  if sub in _STATS:
++    return 'dyn/stats'
++  base = re.sub(r'\d*(norm)?$', '', sub)
++  return 'dyn/' + _ALIAS.get(base, base)
++
++
++def _diagnose(grads, params):
++  """Per-module gradient norms and non-finite counts; non-finite params."""
++  groups = {}
++  for k in grads:
++    groups.setdefault(_group(k), []).append(k)
++  out, total_bad = {}, 0.0
++  for g, keys in sorted(groups.items()):
++    sq = sum(jnp.sum(jnp.square(f32(grads[k]))) for k in keys)
++    bad = sum(jnp.sum(f32(~jnp.isfinite(grads[k]))) for k in keys)
++    out[f'gnorm/{g}'] = jnp.sqrt(sq)
++    out[f'gbad/{g}'] = bad
++    total_bad = total_bad + bad
++  out['grad_nonfinite'] = total_bad
++  out['param_nonfinite'] = sum(
++      jnp.sum(f32(~jnp.isfinite(v))) for v in params.values()
++      if jnp.issubdtype(v.dtype, jnp.floating))
++  return out
+diff --git a/embodied/run/nanwatch.py b/embodied/run/nanwatch.py
+new file mode 100644
+index 0000000..4390dba
+--- /dev/null
++++ b/embodied/run/nanwatch.py
+@@ -0,0 +1,214 @@
++"""NaN watchdog for offline training.
++
++Keeps the last `window` training steps of scalar metrics in memory (dense, per
++update) while the normal logger stays sparse. On the first non-finite event it
++writes a condensed report plus everything needed to replay the bad step:
++
++  <logdir>/nan_report/
++    summary.txt   condensed diagnosis (also printed)
++    ring.jsonl    last `window` updates, all scalar metrics
++    batch.npz     the batch that produced the bad step (incl. its seed)
++    carry.pkl     the train carry fed into that step
++    spaces.pkl    obs/act spaces (to rebuild the agent)
++    ckpt/         agent state BEFORE the bad update (needs agent.nanguard=freeze)
++
++Replay one step (prints the per-module diagnosis of the replayed step):
++  python methods/MoSS/main.py <same configs/flags> \\
++      --run.nan_replay <logdir>/nan_report
++
++EXPERIMENTAL: adding --jax.precompile False runs the replayed step eagerly
++under jax_debug_nans for an op-level traceback. Known limitation: in eager mode
++stock DreamerV3's return normalizer (embodied/jax/utils.py _perc) raises first,
++for the RSSM baseline as well, before the real NaN is reached.
++
++Metrics returned by agent.train() lag one call (they are fetched async), so the
++metrics seen at call i belong to the batch fed at call i-1. References to the
++last two inputs are kept; batch, seed and carry are not donated by the jitted
++train step, so holding them costs no host sync.
++"""
++
++import collections
++import json
++import math
++import pickle
++
++import elements
++import jax
++import numpy as np
++
++
++TREND_KEYS = ('opt/loss', 'opt/grad_norm', 'opt/grad_nonfinite',
++              'moss_eff_experts', 'moss_dead_experts', 'moss_load_max',
++              'moss_active_mass', 'moss_lambda')
++
++
++def _scalars(mets):
++  out = {}
++  for k, v in mets.items():
++    try:
++      a = np.asarray(v)
++    except Exception:
++      continue
++    if a.size == 1 and np.issubdtype(a.dtype, np.number):
++      out[k] = float(a.reshape(()))
++  return out
++
++
++def _bad(x):
++  return not math.isfinite(x)
++
++
++class NanWatch:
++
++  def __init__(self, logdir, window=100, stop=True):
++    self.outdir = elements.Path(logdir) / 'nan_report'
++    self.ring = collections.deque(maxlen=int(window))
++    self.inputs = collections.deque(maxlen=2)
++    self.stop = bool(stop)
++    self.triggered = False
++    self.updates = 0
++
++  def before(self, batch, carry):
++    # Shallow copy: agent.train() pops 'seed' from the dict it receives.
++    self.inputs.append((dict(batch), carry))
++
++  def after(self, mets, step):
++    """Record metrics of the PREVIOUS call; return True on the first NaN."""
++    row = _scalars(mets)
++    if not row:
++      return False
++    self.updates += 1
++    row = {'update': self.updates, 'step': int(step), **row}
++    self.ring.append(row)
++    if self.triggered:
++      return False
++    bad = [k for k, v in row.items() if _bad(v)]
++    flagged = (row.get('opt/skipped', 0) > 0 or
++               row.get('opt/grad_nonfinite', 0) > 0 or
++               row.get('opt/param_nonfinite', 0) > 0)
++    if bad or flagged:
++      self.triggered = True
++      return True
++    return False
++
++  # ------------------------------------------------------------------ dump
++
++  def diagnose(self):
++    rows = list(self.ring)
++    last = rows[-1]
++    bad = sorted(k for k, v in last.items() if _bad(v))
++    losses_bad = [k for k in bad if '/loss/' in k or k.startswith('loss/')
++                  or k.endswith('opt/loss')]
++    if last.get('opt/param_nonfinite', 0) > 0:
++      cat = ('PARAMS already non-finite before this step: the NaN entered '
++             'earlier. Enable --agent.nanguard freeze to stop at the origin.')
++    elif losses_bad:
++      cat = 'FORWARD: a loss value is non-finite ' + str(losses_bad)
++    else:
++      cat = ('BACKWARD: every loss value is finite but the gradient is not '
++             '(e.g. norm/sqrt/log of 0, or 0 * inf inside a jnp.where)')
++    gbad = sorted(((v, k[len('opt/gbad/'):]) for k, v in last.items()
++                   if k.startswith('opt/gbad/') and v > 0), reverse=True)
++    lines = [
++        '=' * 72,
++        f'NaN WATCHDOG  update {last["update"]}  (agent step {last["step"]})',
++        '=' * 72,
++        f'category : {cat}',
++        f'frozen   : {bool(last.get("opt/frozen", 0))}  '
++        f'(replayable checkpoint: {"yes" if last.get("opt/frozen", 0) else "no"})',
++        f'non-finite metrics ({len(bad)}): ' + ', '.join(bad[:25]),
++    ]
++    if gbad:
++      lines.append('modules with non-finite gradients (count): ' + ', '.join(
++          f'{k}={int(v)}' for v, k in gbad[:12]))
++    elif not any(k.startswith('opt/gbad/') for k in last):
++      lines.append('per-module gradients not logged: enable --agent.grad_diag True')
++    gn = sorted(((v, k[len('opt/gnorm/'):]) for k, v in last.items()
++                 if k.startswith('opt/gnorm/') and math.isfinite(v)),
++                reverse=True)
++    if gn:
++      lines.append('largest finite grad norms: ' + ', '.join(
++          f'{k}={v:.3g}' for v, k in gn[:8]))
++    loss_now = {k.split('loss/')[-1]: v for k, v in last.items()
++                if k.startswith('loss/') or '/loss/' in k}
++    if loss_now:
++      lines.append('losses at bad step: ' + ' | '.join(
++          f'{k}={v:.4g}' for k, v in sorted(loss_now.items())))
++    keys = [k for k in TREND_KEYS if any(k in r for r in rows)]
++    keys += [f'opt/gnorm/{k}' for _, k in gn[:3]]
++    if keys:
++      tail = rows[-10:]
++      lines.append(f'trend over the last {len(tail)} updates:')
++      lines.append('  ' + 'update'.rjust(7) + ''.join(
++          k.split('/')[-1][:12].rjust(13) for k in keys))
++      for r in tail:
++        lines.append('  ' + str(r['update']).rjust(7) + ''.join(
++            (f'{r[k]:.4g}' if k in r else '-').rjust(13) for k in keys))
++    lines.append(f'full window ({len(rows)} updates): {self.outdir}/ring.jsonl')
++    return '\n'.join(lines)
++
++  def dump(self, agent, obs_space, act_space):
++    self.outdir.mkdir()
++    rows = list(self.ring)
++    with (self.outdir / 'ring.jsonl').open('w') as f:
++      for r in rows:
++        f.write(json.dumps(r) + '\n')
++    summary = self.diagnose()
++    (self.outdir / 'summary.txt').write(summary + '\n')
++    print(summary)
++    if len(self.inputs) == 2:
++      batch, carry = self.inputs[0]                  # input of the bad step
++      host = {k: np.asarray(v) for k, v in batch.items()}
++      with (self.outdir / 'batch.npz').open('wb') as f:
++        np.savez(f, **host)
++      with (self.outdir / 'carry.pkl').open('wb') as f:
++        pickle.dump(jax.tree.map(np.asarray, carry), f)
++    with (self.outdir / 'spaces.pkl').open('wb') as f:
++      pickle.dump((dict(obs_space), dict(act_space)), f)
++    if rows and rows[-1].get('opt/frozen', 0):
++      cp = elements.Checkpoint(self.outdir / 'ckpt')
++      cp.agent = agent
++      cp.save()
++      print(f'[nanwatch] replayable state saved to {self.outdir}')
++    else:
++      print('[nanwatch] parameters may already be non-finite; no checkpoint '
++            'saved. Re-run with --agent.nanguard freeze to make it replayable.')
++
++
++def replay(agent, nandir, batch_size):
++  """Re-run the saved bad step once; print the diagnosis of its metrics."""
++  nandir = elements.Path(nandir)
++  cp = elements.Checkpoint(nandir / 'ckpt')
++  cp.agent = agent
++  cp.load()
++  with (nandir / 'batch.npz').open('rb') as f:
++    data = dict(np.load(f))
++  seed = data.pop('seed')
++  with (nandir / 'carry.pkl').open('rb') as f:
++    saved_carry = pickle.load(f)
++  dev = next(iter(agent.stream(iter([data]))))
++  dev['seed'] = jax.device_put(seed, dev['seed'].sharding)
++  carry = agent.init_train(batch_size)
++  carry = jax.tree.map(
++      lambda ref, x: jax.device_put(np.asarray(x, ref.dtype), ref.sharding),
++      carry, saved_carry)
++  if getattr(agent, 'jaxcfg', None) is not None and agent.jaxcfg.precompile:
++    print('[nan_replay] train step is AOT-compiled: NaNs are reported per '
++          'step only. Add --jax.precompile False to locate the exact op.')
++  else:
++    # Only now: building the agent itself evaluates a dummy batch whose
++    # outputs can be NaN (stock DreamerV3, harmless), which debug_nans
++    # would report. Eager mode gives an op-level traceback; implicit
++    # host<->device transfers are then needed, so lift the transfer guard.
++    jax.config.update('jax_debug_nans', True)
++    jax.config.update('jax_disable_jit', True)
++    jax.config.update('jax_transfer_guard', 'allow')
++  print('[nan_replay] re-running the saved step')
++  # train() pops 'seed' from its input, so pass copies.
++  carry, _, _ = agent.train(carry, dict(dev))
++  _, _, mets = agent.train(carry, dict(dev))          # fetch lagged metrics
++  watch = NanWatch(nandir.parent, window=1)
++  watch.outdir = nandir / 'replay'
++  watch.after(mets, step=0)
++  print(watch.diagnose())
++  return mets
+diff --git a/embodied/run/train_offline.py b/embodied/run/train_offline.py
+index 3317249..9f59443 100644
+--- a/embodied/run/train_offline.py
++++ b/embodied/run/train_offline.py
+@@ -178,6 +178,15 @@ def train_offline(make_agent, make_logger, args):
+     if (elements.Path(args.logdir) / "ckpt").exists():
+       cp.load()
+ 
++    from . import nanwatch
++    if getattr(args, 'nan_replay', ''):
++      nanwatch.replay(agent, args.nan_replay, args.batch_size)
++      return
++    nan_window = int(getattr(args, 'nan_window', 0) or 0)
++    watch = nanwatch.NanWatch(
++        args.logdir, nan_window, getattr(args, 'nan_stop', True)
++    ) if nan_window else None
++
+     print("Offline CompoSuite train tasks:", len(train_tasks))
+     print("Offline CompoSuite test tasks:", len(test_tasks))
+     print("Start offline Dreamer training loop")
+@@ -185,7 +194,16 @@ def train_offline(make_agent, make_logger, args):
+ 
+     while step < args.steps:
+       batch = next(train_stream)
++      if watch:
++        watch.before(batch, carry_train)
+       carry_train, outs, mets = agent.train(carry_train, batch)
++      if watch and watch.after(mets, step):
++        watch.dump(agent, train_data.obs_space, train_data.act_space)
++        if watch.stop:
++          logger.add(train_agg.result())
++          logger.write()
++          print('[nanwatch] stopping (set --run.nan_stop False to continue)')
++          break
+       if "replay" in outs:
+         pass
+       train_agg.add(mets, prefix="train")
+diff --git a/methods/MoSS/agent.py b/methods/MoSS/agent.py
+index 7a78d95..8e1b17f 100644
+--- a/methods/MoSS/agent.py
++++ b/methods/MoSS/agent.py
+@@ -86,7 +86,8 @@ class Agent(embodied.jax.Agent):
+         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+     self.opt = embodied.jax.Optimizer(
+         self.modules, self._make_opt(**config.opt), summary_depth=1,
+-        name='opt')
++        nanguard=config.get('nanguard', 'off'),
++        diag=config.get('grad_diag', False), name='opt')
+ 
+     scales = self.config.loss_scales.copy()
+     rec = scales.pop('rec')
+diff --git a/methods/MoSS/configs.yaml b/methods/MoSS/configs.yaml
+index bbf4a8c..ee0f7f8 100644
+--- a/methods/MoSS/configs.yaml
++++ b/methods/MoSS/configs.yaml
+@@ -87,6 +87,9 @@ defaults:
+     env_eval_episodes: 5
+     env_eval_horizon: 500
+     env_eval_max_tasks: 0
++    nan_window: 0       # >0: keep the last N updates' metrics, dump them at the first NaN
++    nan_stop: True      # stop training at the first NaN (after dumping)
++    nan_replay: ''      # path to <logdir>/nan_report: re-run the saved bad step
+     from_checkpoint: ''
+     episode_timeout: 180
+     actor_addr: 'localhost:{auto}'
+@@ -110,6 +113,7 @@ defaults:
+     jit: True
+     debug: False
+     debug_nans: False   # --jax.debug_nans True: raise at the first NaN-producing op
++    precompile: True    # set False (with jit False) to replay a step eagerly
+     expect_devices: 0
+     enable_policy: True
+     coordinator_address: ''
+@@ -197,6 +201,8 @@ defaults:
+     report: True
+     report_gradnorms: False
+     offline: {enabled: False, bc_scale: 0.0, imag_policy_scale: 1.0}
++    nanguard: 'off'     # off | skip | freeze (skip bad updates; freeze = keep state replayable)
++    grad_diag: False    # per-module gradient norms / non-finite counts (opt/gnorm/*, opt/gbad/*)
+ 
+   data:
+     root: ''
+@@ -401,4 +407,9 @@ offline_comp_moss:
+     outputs: [jsonl, wandb]
+     wandb_project: offline-comp-moss
+     wandb_group: composuite-moss
+-    wandb_name: moss-offline-comp
+\ No newline at end of file
++    wandb_name: moss-offline-comp
++
++nandebug:
++  agent: {nanguard: freeze, grad_diag: True}
++  run: {nan_window: 100, nan_stop: True}
++  logger: {filter: 'score|length|fps|ratio|train/loss/|train/rand/|moss_|opt/grad_norm|opt/skipped|opt/grad_nonfinite'}
+diff --git a/methods/MoSS/moss.py b/methods/MoSS/moss.py
+index 65358bd..c1c3536 100644
+--- a/methods/MoSS/moss.py
++++ b/methods/MoSS/moss.py
+@@ -470,9 +470,7 @@ class MoSSRSSM(nj.Module):
+     den = jnp.einsum('nk,nm->km', onehot, aw * klpers[:, None])
+     l_b = num / (den + 1e-6)                                # skill score
+     supp = jnp.einsum('nk,nm->km', onehot, delta)
+-    dis_e = jnp.nanpercentile(
+-        jnp.where(onehot > 0, dis[:, None], jnp.nan), self.unc_quantile, 0)
+-    dis_e = jnp.nan_to_num(dis_e)
++    dis_e = _masked_percentile(dis, onehot, self.unc_quantile)  # (K,)
+     present = envcnt > 0
+ 
+     if training:
+@@ -558,4 +556,23 @@ class MoSSRSSM(nj.Module):
+ 
+ def _bce_logits(logit, target):
+   return jnp.maximum(logit, 0) - logit * target + jnp.log1p(
+-      jnp.exp(-jnp.abs(logit)))
+\ No newline at end of file
++      jnp.exp(-jnp.abs(logit)))
++
++
++def _masked_percentile(x, mask, q):
++  """Per-column linear-interpolated percentile of x over rows where mask > 0.
++
++  NaN-free on purpose (masked rows get a large finite sentinel, not NaN), so
++  jax.debug_nans does not fire on it. Columns with no rows return 0.
++  x: (N,), mask: (N, K) -> (K,)
++  """
++  n = mask.sum(0)                                             # (K,)
++  vals = jnp.where(mask > 0, x[:, None], 1e30)
++  srt = jnp.sort(vals, axis=0)                                # valid rows first
++  pos = (q / 100.0) * jnp.maximum(n - 1, 0)
++  lo = jnp.floor(pos).astype(i32)
++  hi = jnp.minimum(lo + 1, jnp.maximum(n - 1, 0).astype(i32))
++  frac = pos - lo
++  vlo = jnp.take_along_axis(srt, lo[None, :], 0)[0]
++  vhi = jnp.take_along_axis(srt, hi[None, :], 0)[0]
++  return jnp.where(n > 0, vlo + frac * (vhi - vlo), 0.0)
+diff --git a/tests_nanwatch.py b/tests_nanwatch.py
+new file mode 100644
+index 0000000..d6174e7
+--- /dev/null
++++ b/tests_nanwatch.py
+@@ -0,0 +1,145 @@
++"""End-to-end test of the NaN guard + watchdog + replay on the real MoSS agent.
++
++  JAX_PLATFORMS=cpu python tests_nanwatch.py grad   # finite loss, NaN gradient
++  JAX_PLATFORMS=cpu python tests_nanwatch.py fwd    # NaN loss value
++
++A NaN is injected at MoSS step AT, then checks that: the guard skips and
++freezes (parameters identical to before the bad step), the watchdog classifies
++it (BACKWARD / FORWARD), dumps ring/batch/carry/ckpt, and (grad mode) a fresh
++agent replaying the dump with jax.debug_nans raises at the injected op.
++"""
++import sys
++import traceback
++sys.path.insert(0, '.')
++
++import elements
++import jax.numpy as jnp
++import numpy as np
++import ruamel.yaml as yaml
++
++from embodied.run import nanwatch
++from methods.MoSS import main as mmain
++import importlib
++# main.py sets __package__ = 'MoSS', so the agent imports 'MoSS.moss':
++# patch THAT module (patching methods.MoSS.moss would have no effect).
++moss = importlib.import_module(mmain.__package__ + '.moss')
++
++MODE, AT = sys.argv[1], 4
++INJ = 'fwd' if MODE == 'fwd' else 'grad'     # 'replay' re-runs the grad case
++B, T, NTASK, OBS, ACT = 2, 16, 3, 93, 8
++LOGDIR = f'/tmp/nanwatch_{INJ}'
++
++orig = moss.MoSSRSSM.loss
++def patched(self, *a, **k):
++  carry, entries, losses, feat, mets = orig(self, *a, **k)
++  bad = self.step.read() >= AT
++  x = jnp.float32(feat['deter']).mean()
++  if INJ == 'grad':
++    v = jnp.where(bad, jnp.zeros(3), jnp.ones(3)) * x
++    losses['mdiv'] = losses['mdiv'] + 0.0 * jnp.linalg.norm(v)  # INJECTED_GRAD_NAN
++  else:
++    losses['mdiv'] = losses['mdiv'] + jnp.where(bad, jnp.nan, 0.0)  # INJECTED_FWD_NAN
++  return carry, entries, losses, feat, mets
++moss.MoSSRSSM.loss = patched
++
++
++def build(debug_nans=False, jit=True, precompile=True):
++  configs = yaml.YAML(typ='safe').load(
++      elements.Path('methods/MoSS/configs.yaml').read())
++  config = elements.Config(configs['defaults'])
++  for name in ['offline_comp', 'offline_comp_moss', 'size1m', 'nandebug']:
++    config = config.update(configs[name])
++  config = config.update({
++      'logdir': LOGDIR, 'batch_size': B, 'batch_length': T,
++      'report_length': 4, 'replay_context': 0,
++      'jax.platform': 'cpu', 'jax.prealloc': False,
++      'jax.debug_nans': debug_nans, 'jax.jit': jit,
++      'jax.precompile': precompile, 'agent.imag_length': 3,
++      'agent.dyn.moss.deter': 64, 'agent.dyn.moss.hidden': 32,
++      'agent.dyn.moss.stoch': 4, 'agent.dyn.moss.classes': 4,
++      'agent.dyn.moss.blocks': 4, 'agent.dyn.moss.experts': 4,
++      'agent.dyn.moss.zdim': 16, 'agent.dyn.moss.nmin': 1,
++      'agent.dyn.moss.nsig': 2, 'agent.dyn.moss.maxsig': 8,
++  })
++  obs_space = {
++      'vector': elements.Space(np.float32, (OBS,)),
++      'reward': elements.Space(np.float32),
++      'is_first': elements.Space(bool), 'is_last': elements.Space(bool),
++      'is_terminal': elements.Space(bool),
++      'task_id': elements.Space(np.int32, (), 0, NTASK),
++      'task_axes': elements.Space(np.int32, (4,), 0, 4),
++  }
++  act_space = {'action': elements.Space(np.float32, (ACT,), -1, 1)}
++  return mmain.make_agent(config, obs_space, act_space), obs_space, act_space
++
++
++rng = np.random.default_rng(0)
++def batch():
++  first = np.zeros((B, T), bool); first[:, 0] = True
++  return {
++      'vector': rng.normal(size=(B, T, OBS)).astype(np.float32),
++      'reward': rng.uniform(size=(B, T)).astype(np.float32),
++      'is_first': first, 'is_last': np.zeros((B, T), bool),
++      'is_terminal': np.zeros((B, T), bool),
++      'task_id': np.repeat(np.arange(B) % NTASK, T).reshape(B, T).astype(np.int32),
++      'task_axes': rng.integers(0, 4, (B, T, 4)).astype(np.int32),
++      'action': rng.uniform(-1, 1, (B, T, ACT)).astype(np.float32),
++      'consec': np.zeros((B, T), np.int32),
++      'stepid': rng.integers(0, 255, (B, T, 20)).astype(np.uint8),
++  }
++
++if MODE == 'replay':          # separate process, like --run.nan_replay
++  agent2, _, _ = build(precompile=False)
++  nanwatch.replay(agent2, f'{LOGDIR}/nan_report', B)
++  raise SystemExit('replay finished WITHOUT raising')
++
++agent, obs_space, act_space = build()
++watch = nanwatch.NanWatch(LOGDIR, window=100, stop=True)
++stream = iter(agent.stream(iter([batch() for _ in range(12)])))
++carry = agent.init_train(B)
++KEY = 'dyn/e0gru/kernel'
++snaps = []
++for call in range(10):
++  snaps.append(np.asarray(agent.params[KEY]).copy())  # host copy before call
++  data = next(stream)
++  watch.before(data, carry)
++  carry, outs, mets = agent.train(carry, data)
++  if watch.after(mets, step=call):
++    bad_call = call - 1                                # metrics lag one call
++    watch.dump(agent, obs_space, act_space)
++    break
++else:
++  raise AssertionError('watchdog never triggered')
++
++now = np.asarray(agent.params[KEY])
++print(f'\n[check] bad step = call {bad_call}; params frozen at pre-bad values: '
++      f'{np.array_equal(now, snaps[bad_call])} (changed before it: '
++      f'{not np.array_equal(snaps[bad_call], snaps[0])})')
++assert np.array_equal(now, snaps[bad_call]), 'freeze failed'
++assert np.isfinite(now).all()
++summary = (watch.outdir / 'summary.txt').read()
++want = 'BACKWARD' if MODE == 'grad' else 'FORWARD'
++assert want in summary, f'expected {want} classification'
++files = sorted(p.name for p in watch.outdir.glob('*'))
++print('[check] classification:', want, '| dumped:', files)
++for f in ('summary.txt', 'ring.jsonl', 'batch.npz', 'carry.pkl', 'spaces.pkl', 'ckpt'):
++  assert f in files, f
++nrows = len((watch.outdir / 'ring.jsonl').read().strip().splitlines())
++print(f'[check] ring.jsonl rows: {nrows}')
++
++if MODE == 'grad':
++  import os, subprocess
++  res = subprocess.run([sys.executable, __file__, 'replay'], capture_output=True,
++                       text=True, env={**os.environ, 'JAX_PLATFORMS': 'cpu'})
++  out = res.stdout + res.stderr
++  # Must come from the REPLAYED step, not from agent construction.
++  after = out.split('[nan_replay]', 1)[1] if '[nan_replay]' in out else ''
++  raised = 'FloatingPointError' in after
++  print(f'[check] eager replay raised FloatingPointError: {raised}; '
++        f'traceback names injected line: {"INJECTED_GRAD_NAN" in after}')
++  for line in after.splitlines():
++    if ('FloatingPointError' in line or 'INJECTED' in line or
++        'tests_nanwatch.py' in line or 'moss.py' in line):
++      print('   ', line.strip()[:160])
++  assert raised, out[-3000:]
++print(f'\nNANWATCH TEST OK ({MODE})')
