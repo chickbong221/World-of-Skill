@@ -194,6 +194,21 @@ jointly: the world model first, then the policy on the frozen model.
 - `task_id` and `task_axes` are part of the world model loss of both agents (the
   decoder reconstructs them). MoSS still does not feed them to its encoder.
 
+### MoSS routing mass per task
+
+MoSS logs the mean soft router mass `pi` (softmax before top-k) that each task
+sends to each expert, as `<prefix>/moss_route/<task>/e<m>` (the 8 values of a
+task sum to 1):
+
+- `train/`: the training batches, pooled over each log interval (sums and
+  counts are averaged first and divided at log time). Router noise is on in
+  the world-model phase and off in the policy phase.
+- `report/`: a train-task batch in eval mode (no noise), every `report_every`.
+- `eval/`: a held-out test-task batch in eval mode, every `eval_every`.
+
+Keys use task names because the test split has its own `task_id`s. A task
+missing from the window is not logged.
+
 ### Episode boundaries
 
 A stored row is `(obs_t, a_t, r_t)` with the end flag of transition `t`, and the

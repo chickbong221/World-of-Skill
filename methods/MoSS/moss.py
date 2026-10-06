@@ -454,7 +454,30 @@ class MoSSRSSM(nj.Module):
     metrics['moss_active_mass'] = (pi * delta).sum(-1).mean()
     metrics['moss_lambda'] = lam
     metrics['moss_dis'] = f32(feat['dis']).mean()
+    if task_id is not None:
+      metrics.update(self._route_mass(pi, task_id, training))
     return carry, entries, losses, feat, metrics
+
+  def _route_mass(self, pi, task_id, training):
+    """Per-task sums of the soft router mass and their counts, as scalars.
+
+    Logged as sums so the train loop can pool them over a log interval and
+    divide once (embodied/run/train_offline.py:route_mass).
+    """
+    K, M = self.num_envs, self.experts
+    onehot = jax.nn.one_hot(task_id.reshape(-1).astype(i32), K, dtype=f32)
+    mass = jnp.einsum('nk,nm->km', onehot, pi.reshape((-1, M)))   # (K, M)
+    cnt = onehot.sum(0)                                            # (K,)
+    if training:
+      axes = internal.get_data_axes()
+      if axes:
+        mass, cnt = jax.lax.psum((mass, cnt), axes)
+    mets = {}
+    for k in range(K):
+      mets[f'moss_route_cnt/t{k:02d}'] = cnt[k]
+      for m in range(M):
+        mets[f'moss_route_sum/t{k:02d}/e{m}'] = mass[k, m]
+    return mets
 
   def _subset_loss(self, env, delta, pit, klexp, klpers, dis,
                    deter, stoch, shared, prev, training):

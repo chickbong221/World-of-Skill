@@ -47,6 +47,25 @@ class StepClock:
     return False
 
 
+def route_mass(mets, prefix, tasks):
+  """Turns the MoSS per-task router mass sums and counts into mean soft mass
+  per (task, expert), keyed by task name: <prefix>moss_route/<task>/e<m>.
+  Tasks absent from the window are dropped instead of logged as 0."""
+  sums = f'{prefix}moss_route_sum/t'
+  cnts = f'{prefix}moss_route_cnt/t'
+  if not any(k.startswith(sums) for k in mets):
+    return mets
+  mets = dict(mets)
+  cnt = {k[len(cnts):]: mets.pop(k) for k in list(mets) if k.startswith(cnts)}
+  for key in [k for k in mets if k.startswith(sums)]:
+    value = mets.pop(key)
+    task, expert = key[len(sums):].split('/')
+    k, n = int(task), float(cnt.get(task, 0))
+    if k < len(tasks) and n > 0:
+      mets[f'{prefix}moss_route/{tasks[k].name}/{expert}'] = float(value) / n
+  return mets
+
+
 def train_offline(make_agent, make_logger, args):
   train_data, train_report_data, test_report_data, train_tasks, test_tasks = (
       make_datasets(
@@ -120,7 +139,7 @@ def train_offline(make_agent, make_logger, args):
       if should_eval(step):
         carry_report, mets = agent.report(
             carry_report, next(test_report_stream))
-        logger.add(mets, prefix="eval")
+        logger.add(route_mass(mets, '', test_tasks), prefix="eval")
         logger.add({
             "tasks/train": len(train_tasks),
             "tasks/test": len(test_tasks),
@@ -130,7 +149,7 @@ def train_offline(make_agent, make_logger, args):
       if should_report(step):
         carry_report, mets = agent.report(
             carry_report, next(train_report_stream))
-        logger.add(mets, prefix="report")
+        logger.add(route_mass(mets, '', train_tasks), prefix="report")
 
       # Env evals follow the policy updates only (all updates when joint).
       pstep = int(step) - wm_steps
@@ -176,7 +195,7 @@ def train_offline(make_agent, make_logger, args):
           count["policy_updates"] = max(updates - wm_steps, 0)
           count["phase_policy"] = float(updates > wm_steps)
         logger.add(count, prefix="offline")
-        logger.add(train_agg.result())
+        logger.add(route_mass(train_agg.result(), 'train/', train_tasks))
         logger.add(train_data.stats(), prefix="dataset/train")
         logger.add(test_report_data.stats(), prefix="dataset/test")
         logger.add(usage.stats(), prefix="usage")
