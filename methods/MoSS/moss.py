@@ -58,6 +58,7 @@ DEFAULT_SCALES = dict(
     mdiv=1.0,     # expert feature decorrelation (batch-invariant)
     msp=0.001,    # routing mass on the active set
     mbal=0.01,    # balanced soft routing mass
+    msep=0.0,     # route separation -I(task; expert), off by default
     mrew=1.0,     # per-expert reward head        (only if expert_heads)
     mcon=1.0,     # per-expert continuation head  (only if expert_heads)
 )
@@ -438,6 +439,24 @@ class MoSSRSSM(nj.Module):
       losses['msub'] = jnp.broadcast_to(lam * sub, (B, T))
       metrics.update(rmets)
 
+    # L_sep: -I(task; expert) on the soft router mass (MoDULE's route
+    # separation). I = H(E) - H(E|task), so it also balances the load, and a
+    # collapsed or task-independent router scores 0, its worst value.
+    if task_id is None:
+      losses['msep'] = jnp.zeros((B, T), f32)
+    else:
+      sums, cnt, rmets = self._route_mass(pi, task_id, training)
+      mi, he, heg = route_mi(sums, cnt)
+      norm = min(np.log(self.num_envs), np.log(M))
+      losses['msep'] = jnp.broadcast_to(-mi / norm, (B, T))
+      present = (cnt > 0).sum()
+      metrics.update(rmets)
+      metrics['moss_sep_mi'] = mi
+      metrics['moss_sep_mi_norm'] = mi / jnp.minimum(
+          jnp.log(jnp.maximum(present, 2).astype(f32)), np.log(M))
+      metrics['moss_route_HE'] = he
+      metrics['moss_route_HEG'] = heg
+
     if training:
       self.step.write(self.step.read() + 1.0)
 
@@ -454,15 +473,14 @@ class MoSSRSSM(nj.Module):
     metrics['moss_active_mass'] = (pi * delta).sum(-1).mean()
     metrics['moss_lambda'] = lam
     metrics['moss_dis'] = f32(feat['dis']).mean()
-    if task_id is not None:
-      metrics.update(self._route_mass(pi, task_id, training))
     return carry, entries, losses, feat, metrics
 
   def _route_mass(self, pi, task_id, training):
-    """Per-task sums of the soft router mass and their counts, as scalars.
+    """Per-task sums of the soft router mass (K, M) and counts (K,).
 
-    Logged as sums so the train loop can pool them over a log interval and
-    divide once (embodied/run/train_offline.py:route_mass).
+    Also returned as scalar metrics, logged as sums so the train loop can pool
+    them over a log interval and divide once
+    (embodied/run/train_offline.py:route_mass).
     """
     K, M = self.num_envs, self.experts
     onehot = jax.nn.one_hot(task_id.reshape(-1).astype(i32), K, dtype=f32)
@@ -477,7 +495,7 @@ class MoSSRSSM(nj.Module):
       mets[f'moss_route_cnt/t{k:02d}'] = cnt[k]
       for m in range(M):
         mets[f'moss_route_sum/t{k:02d}/e{m}'] = mass[k, m]
-    return mets
+    return mass, cnt, mets
 
   def _subset_loss(self, env, delta, pit, klexp, klpers, dis,
                    deter, stoch, shared, prev, training):
@@ -575,6 +593,20 @@ class MoSSRSSM(nj.Module):
                      / jnp.maximum((self.eseen.read() > 0).sum(), 1),
     }
     return loss, mets
+
+
+def route_mi(sums, cnt, eps=1e-8):
+  """I(G;E) = H(E) - H(E|G) in nats, from per-group mass sums (G, M) and
+  counts (G,). Absent groups (count 0) get P(g) = 0 and drop out.
+  Returns (I, H(E), H(E|G))."""
+  W = sums / jnp.maximum(cnt[:, None], 1.0)
+  W = W / jnp.maximum(W.sum(-1, keepdims=True), eps)      # rows sum to 1
+  pg = cnt / jnp.maximum(cnt.sum(), 1.0)
+  joint = pg[:, None] * W                                  # P(g, e)
+  pe = joint.sum(0)                                        # P(e)
+  he = -(pe * jnp.log(jnp.maximum(pe, eps))).sum()
+  heg = -(joint * jnp.log(jnp.maximum(W, eps))).sum()
+  return he - heg, he, heg
 
 
 def _bce_logits(logit, target):

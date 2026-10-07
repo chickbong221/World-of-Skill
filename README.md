@@ -209,6 +209,23 @@ task sum to 1):
 Keys use task names because the test split has its own `task_id`s. A task
 missing from the window is not logged.
 
+### MoSS route separation (L_sep)
+
+`msep` (off by default) is MoDULE's route-separation loss on task ids:
+`-I(task; expert) / min(log K, log M)` in [-1, 0], from the batch's per-task
+soft router mass. `I = H(E) - H(E|task)`, so it also balances the load; a
+collapsed or task-independent router scores 0, its worst value. To use it in
+place of `mbal`:
+
+```bash
+python methods/MoSS/main.py --configs offline_comp offline_comp_moss \
+  --agent.moss_scales.mbal 0 --agent.moss_scales.msep 1.0
+```
+
+Logged next to it: `moss_sep_mi` (nats), `moss_sep_mi_norm` (normalized by the
+tasks present, so `eval/` is on the 3 test tasks' scale), `moss_route_HE` and
+`moss_route_HEG`.
+
 ### Episode boundaries
 
 A stored row is `(obs_t, a_t, r_t)` with the end flag of transition `t`, and the

@@ -173,6 +173,7 @@ defaults:
       msub: 1.0
       mbal: 0.003
       msp: 1.0
+      msep: 0.0     # L_sep = -I(task; expert); try 1.0 with mbal 0
       mexp: 0.1
     enc:
       typ: simple
