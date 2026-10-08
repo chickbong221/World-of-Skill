@@ -95,6 +95,9 @@ def train_offline(make_agent, make_logger, args):
     should_report = Clock(args.report_every)
     should_eval = Clock(args.eval_every)
     should_env_eval = Clock(getattr(args, 'env_eval_every', 0))
+    # Checkpoints for resuming, in the same unit as the other clocks; <= 0
+    # disables them (offline runs saved none before).
+    should_save = Clock(getattr(args, 'save_every', 0))
 
     train_stream = embodied.streams.Stateless(
         lambda: train_data.sample(args.batch_size))
@@ -201,6 +204,9 @@ def train_offline(make_agent, make_logger, args):
         logger.add(usage.stats(), prefix="usage")
         logger.add({"timer": elements.timer.stats()["summary"]})
         logger.write()
+
+      if should_save(step):
+        cp.save()
 
     logger.close()
   finally:
