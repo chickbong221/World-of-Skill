@@ -161,13 +161,50 @@ Differences to keep in mind:
   in the reference. Everything is under `agent:` in
   `methods/offline_rl/configs.yaml`.
 - One update consumes `batch_size` transitions and `run.steps` /
-  `run.*_every` count transitions, e.g. 1M updates of TD3+BC is
-  `--run.steps 2.56e8`.
+  `run.*_every` count transitions: the default `7.68e7` is 300K updates of 256
+  (IQL `3.072e8`, 300K updates of 1024), the length of the LEQ phases below.
+
+## LEQ (default)
+
+`--configs offline_comp` (MoSS: `offline_comp offline_comp_moss`) trains the
+world model, then the policy with LEQ (Park & Lee, ICLR 2025,
+[kwanyoungpark/LEQ](https://github.com/kwanyoungpark/LEQ)) on the frozen model,
+following LEQ's pixel-experiment recipe. Only the world model differs between
+the two methods.
+
+| | updates | batch x length |
+| --- | --- | --- |
+| world model | 300,000 | 64 x 50 |
+| policy (LEQ actor + critic) | 300,000 | 64 x 50 (3,200 rollout starts) |
+
+- World model: DreamerV3 with 7 prior heads (`dyn.rssm.ensemble 7`), one sampled
+  per imagined step and sample, as in LEQ / Offline DV2. MoSS uses its routed
+  experts instead, with its uncertainty penalty off (`dyn.moss.beta_unc 0`).
+- Actor (`embodied/jax/leq.py`): deterministic, the tanh mean of the policy
+  head, trained DDPG-style. For every imagined step t it follows the gradient of
+  the lambda-return from t w.r.t. a_t through the model, reward, continue and Q,
+  weighted by tau where that return is above Q and 1 - tau below (0.5 at the
+  last step). Env evaluation acts with the same deterministic action.
+- Critic: Q(s, a) on the latent state, lower-expectile (tau) regression of the
+  imagined lambda-returns (weight 0.25), TD on the data transitions (0.75,
+  actions clipped to [-1, 1]) and an EMA regulariser towards the target critic.
+- `agent.leq`: tau 0.1 (LEQ's recommended start; the paper tunes it per dataset
+  in {0.1, 0.3, 0.5}), lambda 0.95, ratio 0.25, Adam actor 3e-5 with cosine decay
+  to 0 over the policy phase, critic 1e-4, target rate 0.005. Horizon 5
+  (`imag_length`), gamma 0.997 (`horizon 333`), no BC.
+- Not taken from LEQ: rollouts start from the posterior state of every dataset
+  step (LEQ's state version starts from model-expanded data, its pixel version
+  doesn't say), one rollout serves the actor and the critic update, no BC / FQE
+  pretraining (state version only, off by default), and the per-step action
+  gradients come from one backward pass (d ret_0 / d a_t = prod(coef[:t]) d ret_t
+  / d a_t) instead of a Jacobian.
+
+Stack `offline_dv2` after the configs for the previous default below.
 
 ## Offline DV2 Schedule (v-d4rl)
 
-`--configs offline_comp` (MoSS: `offline_comp offline_comp_moss`), the default
-offline setting, trains like v-d4rl's `offlinedv2/train_offline.py` instead of
+`--configs offline_comp offline_dv2` (MoSS: `offline_comp offline_comp_moss
+offline_dv2`) trains like v-d4rl's `offlinedv2/train_offline.py` instead of
 jointly: the world model first, then the policy on the frozen model.
 
 | | updates | batch x length | transitions |
@@ -190,7 +227,8 @@ jointly: the world model first, then the policy on the frozen model.
   (v-d4rl evaluates 1 episode every 200 updates on a single task; 16 tasks x 10
   episodes cannot do that); the test-split report is also every 10K.
   Stack `offline_comp_joint` after `offline_comp` for the earlier joint protocol
-  (1e9 transitions of 32 x 64, counted in transitions).
+  (300K updates of 32 x 64 = 6.144e8 transitions, counted in transitions; was
+  1e9).
 - `task_id` and `task_axes` are part of the world model loss of both agents (the
   decoder reconstructs them). MoSS still does not feed them to its encoder.
 

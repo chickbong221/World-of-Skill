@@ -102,6 +102,11 @@ class Agent(embodied.jax.Agent):
       self.opt_ac = embodied.jax.Optimizer(
           [self.pol, self.val], self._make_opt(**config.opt),
           summary_depth=1, name='opt_ac')
+    # ac leq: the policy phase is LEQ (embodied/jax/leq.py), not Dreamer.
+    self.leq = config.get('ac', 'dreamer') == 'leq'
+    if self.leq:
+      assert self.phases, 'ac leq needs schedule two_phase'
+      embodied.jax.leq.setup(self, config)
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
@@ -160,7 +165,7 @@ class Agent(embodied.jax.Agent):
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
     policy = self.pol(self.feat2tensor(feat), bdims=1)
-    act = sample(policy)
+    act = {k: v.pred() for k, v in policy.items()} if self.leq else sample(policy)
     out = {}
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
@@ -175,6 +180,8 @@ class Agent(embodied.jax.Agent):
     return self._train_phase(carry, data, 'wm')
 
   def train_policy(self, carry, data):
+    if self.leq:
+      return embodied.jax.leq.train(self, carry, data)
     return self._train_phase(carry, data, 'policy')
 
   def _train_phase(self, carry, data, phase):
@@ -268,7 +275,7 @@ class Agent(embodied.jax.Agent):
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
     wm_keys = set(losses)
-    if phase == 'wm':
+    if phase == 'wm' or self.leq:  # leq reports only the world model
       return finish(wm_keys)
 
     # Imagination

@@ -76,6 +76,7 @@ def train_offline(make_agent, make_logger, args):
     should_report = Clock(args.report_every)
     should_eval = Clock(args.eval_every)
     should_env_eval = Clock(getattr(args, 'env_eval_every', 0))
+    should_save = embodied.LocalClock(args.save_every)
 
     train_stream = embodied.streams.Stateless(
         lambda: train_data.sample(args.batch_size))
@@ -162,6 +163,9 @@ def train_offline(make_agent, make_logger, args):
                   f"{type(exc).__name__}: {exc}")
             traceback.print_exc()
 
+      if should_save(step):
+        cp.save()
+
       if should_log(step):
         now, wait = time.time(), train_stream.wait
         span = max(now - perf[0], 1e-6)
@@ -183,6 +187,7 @@ def train_offline(make_agent, make_logger, args):
         logger.add({"timer": elements.timer.stats()["summary"]})
         logger.write()
 
+    cp.save()
     logger.close()
   finally:
     train_data.close()

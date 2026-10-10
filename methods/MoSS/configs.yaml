@@ -202,6 +202,11 @@ defaults:
     report: True
     report_gradnorms: False
     offline: {enabled: False, bc_scale: 0, imag_policy_scale: 1.0}
+    # Policy phase of two_phase: dreamer (stochastic actor, REINFORCE, V critic)
+    # or leq (embodied/jax/leq.py; LEQ, Park & Lee, ICLR 2025). anneal -1 = the
+    # actor lr decays to 0 over the policy updates (steps - wm_steps).
+    ac: dreamer
+    leq: {expectile: 0.1, lam: 0.95, ratio: 0.25, actor_lr: 3e-5, critic_lr: 1e-4, anneal: -1, target_rate: 0.005, critic: {layers: 3, units: 1024, act: silu, norm: rms, output: mse, outscale: 0.0, winit: trunc_normal_in}}
 
   data:
     root: ''
@@ -337,11 +342,12 @@ offline_comp:
   <<: *size25m
   task: offline_comp
   script: train_offline
-  # v-d4rl Offline DV2 protocol (offlinedv2/train_offline.py, `dmc_vision`): the
-  # world model for 25100 updates (offline_model_train_steps 25001, in blocks of
-  # 100), then the policy for 2e5 updates (steps) on the frozen model, batch
-  # 64 x length 50 = 3200 transitions per update. The logged step counts updates.
-  # `offline_comp_joint` is the earlier joint 1e9-transition protocol.
+  # LEQ (Park & Lee, ICLR 2025), the recipe of its pixel experiments with this
+  # world model in place of the DreamerV3 ensemble: imagination horizon 5,
+  # then the LEQ actor-critic on the frozen model, no uncertainty penalty.
+  # World model 3e5 updates, then the policy 3e5 updates, batch 64 x length 50
+  # (Offline DV2) = 3200 transitions per update. The logged step counts updates.
+  # `offline_dv2` is the previous default, `offline_comp_joint` the joint one.
   batch_size: 64
   batch_length: 50
   replay_context: 0
@@ -349,8 +355,8 @@ offline_comp:
     schedule: two_phase
     step_unit: updates
     clock: step
-    wm_steps: 25100
-    steps: 225100           # + 200000 policy updates
+    wm_steps: 300000
+    steps: 600000           # + 300000 policy updates
     log_every: 1000
     report_every: 10000     # train-split report (v-d4rl eval_every 1e4)
     eval_every: 10000       # test-split report
@@ -367,6 +373,9 @@ offline_comp:
   jax:
     prealloc: false
   agent:
+    ac: leq
+    imag_length: 5
+    dyn: {moss: {beta_unc: 0.0}}
     offline:
       enabled: true
       bc_scale: 0
@@ -417,16 +426,25 @@ offline_comp_moss:
     wandb_name: moss-offline-comp
 
 
-# The earlier protocol: joint world model + policy updates, 1e9 transitions of
-# 32 x 64, counted in transitions. Stack after offline_comp (and offline_comp_moss).
+# The previous default, v-d4rl Offline DV2 (offlinedv2/train_offline.py,
+# `dmc_vision`): world model 25100 updates, then the Dreamer actor-critic for
+# 2e5 updates on the frozen model. Stack after offline_comp (and offline_comp_moss).
+offline_dv2:
+  run: {wm_steps: 25100, steps: 225100}
+  agent: {ac: dreamer, imag_length: 15, dyn: {moss: {beta_unc: 1.0}}}
+
+# The earlier protocol: joint world model + policy updates of 32 x 64, counted
+# in transitions, 3e5 updates (6.144e8 transitions; was 1e9). Stack after
+# offline_comp (and offline_comp_moss).
 offline_comp_joint:
   batch_size: 32
   batch_length: 64
+  agent: {ac: dreamer, imag_length: 15, dyn: {moss: {beta_unc: 1.0}}}
   run:
     schedule: joint
     step_unit: samples
     wm_steps: 0
-    steps: 1e9
+    steps: 6.144e8
     log_every: 100000
     report_every: 1000000
     eval_every: 2000000

@@ -30,6 +30,7 @@ class RSSM(nj.Module):
   absolute: bool = False
   blocks: int = 8
   free_nats: float = 1.0
+  ensemble: int = 1  # prior heads; >1 samples one per step and sample (Offline DV2)
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
@@ -159,11 +160,20 @@ class RSSM(nj.Module):
     return deter
 
   def _prior(self, feat):
-    x = feat
+    if self.ensemble == 1:
+      return self._head(feat, '')
+    logits = jnp.stack(
+        [self._head(feat, f'_{k}') for k in range(self.ensemble)], -3)
+    idx = jax.random.randint(nj.seed(), feat.shape[:-1], 0, self.ensemble)
+    pick = jax.nn.one_hot(idx, self.ensemble, dtype=logits.dtype)
+    return (pick[..., None, None] * logits).sum(-3)
+
+  def _head(self, x, sfx):
     for i in range(self.imglayers):
-      x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
-    return self._logit('priorlogit', x)
+      x = self.sub(f'prior{i}{sfx}', nn.Linear, self.hidden, **self.kw)(x)
+      x = nn.act(self.act)(
+          self.sub(f'prior{i}norm{sfx}', nn.Norm, self.norm)(x))
+    return self._logit('priorlogit' + sfx, x)
 
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)

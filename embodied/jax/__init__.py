@@ -13,3 +13,4 @@ from .opt import Optimizer
 from . import nets
 from . import outs
 from . import opt
+from . import leq

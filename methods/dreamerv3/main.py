@@ -98,8 +98,11 @@ def make_agent(config, obs_space=None, act_space=None):
     return embodied.RandomAgent(obs_space, act_space)
   cpdir = elements.Path(config.logdir)
   cpdir = cpdir.parent if config.replicas > 1 else cpdir
+  agent = config.agent
+  if agent.ac == 'leq' and agent.leq.anneal < 0:  # one decay over the policy phase
+    agent = agent.update({'leq.anneal': int(config.run.steps - config.run.wm_steps)})
   return Agent(obs_space, act_space, elements.Config(
-      **config.agent,
+      **agent,
       logdir=config.logdir,
       seed=config.seed,
       jax=config.jax,

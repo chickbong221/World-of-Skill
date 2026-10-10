@@ -27,7 +27,7 @@ defaults:
     wandb_name: ''
 
   run:
-    steps: 1e9              # 3.9M updates of 256 (iql: 0.98M of 1024)
+    steps: 7.68e7           # 3e5 updates of 256 (iql: 3.072e8, 3e5 of 1024)
     clock: step
     log_every: 100000
     report_every: 1000000   # train-split report
@@ -39,6 +39,7 @@ defaults:
     env_eval_slots: 1       # parallel envs per task during env eval (~0.7GB RAM each)
     env_eval_workers: 0     # env processes; 0 = half the cpus, -1 = step envs in-process
     from_checkpoint: ''
+    save_every: 900         # seconds between checkpoints
     usage: {psutil: True, nvsmi: True, gputil: False, malloc: False, gc: False}
 
   jax:
@@ -134,6 +135,7 @@ td3bc:
 iql:
   agent: {algo: iql}
   batch_size: 1024
+  run: {steps: 3.072e8}
   logger: {wandb_name: iql-offline-comp}
 
 debug:
