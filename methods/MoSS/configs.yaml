@@ -410,15 +410,20 @@ offline_comp:
         - Panda_Plate_GoalWall_PickPlace
         - Panda_Hollowbox_ObjectWall_PickPlace
 
-# MoSS variant of the offline recombination test.
-# Only flips dyn.typ and logging identifiers; everything else inherits
-# from offline_comp when stacked as `--configs offline_comp offline_comp_moss`.
-# The `<<: *size25m` on offline_comp already sized both rssm and moss blocks,
-# so we deliberately DO NOT re-apply a size preset here.
+# MoSS variant of the offline recombination test, stacked as
+# `--configs offline_comp offline_comp_moss`: dyn.typ moss with the world model
+# at the size12m widths (24M, near the 28M of the DreamerV3 size25m baseline
+# with 7 prior heads). The actor and the LEQ critic keep the size25m width of
+# offline_comp, so only the world model differs.
 offline_comp_moss:
   agent:
     dyn:
       typ: moss
+      moss: {deter: 2048, hidden: 256, classes: 16}
+    enc: {simple: {depth: 16, units: 256}}
+    dec: {simple: {depth: 16, units: 256}}
+    rewhead: {units: 256}
+    conhead: {units: 256}
   logger:
     outputs: [jsonl, wandb]
     wandb_project: offline-comp-moss

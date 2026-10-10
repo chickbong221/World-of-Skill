@@ -36,7 +36,10 @@ class Agent(embodied.jax.Agent):
     self.config = config
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
-    enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
+    # task_id is a dataset index, unknown in the env (eval feeds 0), so it is
+    # only reconstructed, not encoded.
+    enc_space = {
+        k: v for k, v in obs_space.items() if k not in exclude + ('task_id',)}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
     self.enc = {
         'simple': rssm.Encoder,

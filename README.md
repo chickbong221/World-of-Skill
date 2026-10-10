@@ -160,9 +160,9 @@ Differences to keep in mind:
 - `alpha` is the TD3+BC paper's 2.5 (reference: 0.01); IQL uses batch 1024 as
   in the reference. Everything is under `agent:` in
   `methods/offline_rl/configs.yaml`.
-- One update consumes `batch_size` transitions and `run.steps` /
-  `run.*_every` count transitions: the default `7.68e7` is 300K updates of 256
-  (IQL `3.072e8`, 300K updates of 1024), the length of the LEQ phases below.
+- One update consumes `batch_size` transitions. `run.steps` and `run.*_every`
+  count updates (`run.step_unit: updates`): 300K updates, with reports and
+  live-env evaluation every 10K, as each LEQ phase below.
 
 ## LEQ (default)
 
@@ -177,9 +177,10 @@ the two methods.
 | world model | 300,000 | 64 x 50 |
 | policy (LEQ actor + critic) | 300,000 | 64 x 50 (3,200 rollout starts) |
 
-- World model: DreamerV3 with 7 prior heads (`dyn.rssm.ensemble 7`), one sampled
-  per imagined step and sample, as in LEQ / Offline DV2. MoSS uses its routed
-  experts instead, with its uncertainty penalty off (`dyn.moss.beta_unc 0`).
+- World model: DreamerV3 size25m with 7 prior heads (`dyn.rssm.ensemble 7`, 28M),
+  one sampled per imagined step and sample, as in LEQ / Offline DV2. MoSS uses
+  its routed experts instead at the size12m widths (24M), with its uncertainty
+  penalty off (`dyn.moss.beta_unc 0`). The actor and critic are the same.
 - Actor (`embodied/jax/leq.py`): deterministic, the tanh mean of the policy
   head, trained DDPG-style. For every imagined step t it follows the gradient of
   the lambda-return from t w.r.t. a_t through the model, reward, continue and Q,
@@ -230,7 +231,9 @@ jointly: the world model first, then the policy on the frozen model.
   (300K updates of 32 x 64 = 6.144e8 transitions, counted in transitions; was
   1e9).
 - `task_id` and `task_axes` are part of the world model loss of both agents (the
-  decoder reconstructs them). MoSS still does not feed them to its encoder.
+  decoder reconstructs them). Neither encoder reads `task_id`, a dataset index
+  the env cannot provide (live-env evaluation feeds 0); DreamerV3's encoder
+  reads `task_axes`, MoSS's reads neither.
 
 ### Episode boundaries
 

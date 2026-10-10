@@ -402,7 +402,9 @@ class MoSSRSSM(nj.Module):
     losses['msp'] = 1.0 - (pi * delta).sum(-1)
     pbar = pi.mean((0, 1))
     if self.bal_impl == 'switch':
-      fbar = delta.mean((0, 1)) * (M / max(self.topk, 1))
+      # Switch Transformer: f_m = fraction of active slots on expert m (sums
+      # to 1), so the loss is 1.0 when balanced (previously M = 8x larger).
+      fbar = delta.mean((0, 1)) / max(self.topk, 1)
       bal = M * (fbar * pbar).sum()
     else:
       bal = jnp.square(pbar - 1.0 / M).sum()
@@ -411,7 +413,9 @@ class MoSSRSSM(nj.Module):
     # L_div on masked expert features.
     z = f32(feat['zexp']) * delta[..., None]
     z = z.reshape((B * T, M, self.zdim)).transpose((1, 0, 2))
-    z = z / (jnp.linalg.norm(z, axis=(1, 2), keepdims=True) + 1e-8)
+    # Safe norm: jnp.linalg.norm has a NaN gradient at exactly 0, which
+    # happens whenever an expert is unused for a whole batch.
+    z = z / jnp.sqrt(jnp.sum(z * z, axis=(1, 2), keepdims=True) + 1e-12)
     # No 1/|B|: Z-bar is already Frobenius-normalized, so the extra factor
     # made L_div ~1e-7 and scale as 1/|B|^2. Now batch-invariant in [0, 1].
     gram = jnp.einsum('mnd,pne->mpde', z, z)
@@ -440,6 +444,13 @@ class MoSSRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['moss_usage'] = delta.mean()
+    # Collapse monitors: dead experts get zero gradient from predictions and,
+    # before the safe-norm fix, a NaN gradient from L_div.
+    load = delta.mean((0, 1)) / max(self.topk, 1)            # sums to 1
+    metrics['moss_load_max'] = load.max()
+    metrics['moss_dead_experts'] = (load == 0).astype(f32).sum()
+    metrics['moss_eff_experts'] = jnp.exp(
+        -(load * jnp.log(load + 1e-12)).sum())               # 1..M
     metrics['moss_active_mass'] = (pi * delta).sum(-1).mean()
     metrics['moss_lambda'] = lam
     metrics['moss_dis'] = f32(feat['dis']).mean()
@@ -459,9 +470,7 @@ class MoSSRSSM(nj.Module):
     den = jnp.einsum('nk,nm->km', onehot, aw * klpers[:, None])
     l_b = num / (den + 1e-6)                                # skill score
     supp = jnp.einsum('nk,nm->km', onehot, delta)
-    dis_e = jnp.nanpercentile(
-        jnp.where(onehot > 0, dis[:, None], jnp.nan), self.unc_quantile, 0)
-    dis_e = jnp.nan_to_num(dis_e)
+    dis_e = _masked_percentile(dis, onehot, self.unc_quantile)  # (K,)
     present = envcnt > 0
 
     if training:
@@ -548,3 +557,22 @@ class MoSSRSSM(nj.Module):
 def _bce_logits(logit, target):
   return jnp.maximum(logit, 0) - logit * target + jnp.log1p(
       jnp.exp(-jnp.abs(logit)))
+
+
+def _masked_percentile(x, mask, q):
+  """Per-column linear-interpolated percentile of x over rows where mask > 0.
+
+  NaN-free on purpose (masked rows get a large finite sentinel, not NaN), so
+  jax.debug_nans does not fire on it. Columns with no rows return 0.
+  x: (N,), mask: (N, K) -> (K,)
+  """
+  n = mask.sum(0)                                             # (K,)
+  vals = jnp.where(mask > 0, x[:, None], 1e30)
+  srt = jnp.sort(vals, axis=0)                                # valid rows first
+  pos = (q / 100.0) * jnp.maximum(n - 1, 0)
+  lo = jnp.floor(pos).astype(i32)
+  hi = jnp.minimum(lo + 1, jnp.maximum(n - 1, 0).astype(i32))
+  frac = pos - lo
+  vlo = jnp.take_along_axis(srt, lo[None, :], 0)[0]
+  vhi = jnp.take_along_axis(srt, hi[None, :], 0)[0]
+  return jnp.where(n > 0, vlo + frac * (vhi - vlo), 0.0)

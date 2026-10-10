@@ -6,9 +6,9 @@ defaults:
   task: offline_comp
   seed: 42
   script: train_offline
-  # One update consumes batch_size transitions: a window is (obs, next obs), so
-  # `steps` counts transitions and `run.*_every` below are in transitions, with
-  # the budget and log / report / eval points of methods/dreamerv3 and MoSS.
+  # One update consumes batch_size transitions: a window is (obs, next obs).
+  # `steps` and `run.*_every` count updates (step_unit), with the budget and the
+  # log / report / eval points of each LEQ phase of methods/dreamerv3 and MoSS.
   batch_size: 256
   batch_length: 1
   report_length: 1
@@ -27,12 +27,13 @@ defaults:
     wandb_name: ''
 
   run:
-    steps: 7.68e7           # 3e5 updates of 256 (iql: 3.072e8, 3e5 of 1024)
+    step_unit: updates      # updates | samples (transitions)
+    steps: 300000
     clock: step
-    log_every: 100000
-    report_every: 1000000   # train-split report
-    eval_every: 2000000     # test-split report
-    env_eval_every: 2000000 # live-env rollouts; 0 disables
+    log_every: 1000
+    report_every: 10000     # train-split report
+    eval_every: 10000       # test-split report
+    env_eval_every: 10000   # live-env rollouts; 0 disables
     env_eval_episodes: 10   # episodes per task
     env_eval_horizon: 500
     env_eval_max_tasks: 0   # cap tasks evaluated per split; 0 = all
@@ -135,7 +136,6 @@ td3bc:
 iql:
   agent: {algo: iql}
   batch_size: 1024
-  run: {steps: 3.072e8}
   logger: {wandb_name: iql-offline-comp}
 
 debug:

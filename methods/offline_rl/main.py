@@ -65,7 +65,9 @@ def make_agent(config, obs_space, act_space):
   from .agent import Agent
   agent = config.agent
   if agent.anneal < 0:  # one cosine decay over the whole run, in actor steps
-    updates = int(config.run.steps / (config.batch_size * config.batch_length))
+    updates = int(config.run.steps)
+    if config.run.step_unit != 'updates':
+      updates //= config.batch_size * config.batch_length
     if agent.algo == 'td3bc':
       updates //= agent.policy_freq
     agent = agent.update(anneal=updates)
