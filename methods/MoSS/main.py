@@ -111,6 +111,7 @@ def make_agent(config, obs_space=None, act_space=None):
       batch_length=config.batch_length,
       replay_context=config.replay_context,
       report_length=config.report_length,
+      schedule=config.run.get('schedule', 'joint'),
       replica=config.replica,
       replicas=config.replicas,
   ))

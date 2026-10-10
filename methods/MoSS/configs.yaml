@@ -83,10 +83,15 @@ defaults:
     eval_video_freq: 0
     eval_reconfiguration_frequency: 1
     report_batches: 1
+    env_eval_slots: 1   # parallel envs per task during env eval (~0.7GB RAM each)
+    env_eval_workers: 0 # env processes; 0 = half the cpus, -1 = step envs in-process
     env_eval_every: 0
     env_eval_episodes: 5
     env_eval_horizon: 500
     env_eval_max_tasks: 0
+    step_unit: samples  # samples | updates: what the logged step counts
+    schedule: joint     # joint | two_phase (world model, then policy; offline only)
+    wm_steps: 0         # two_phase: updates of the world model phase
     from_checkpoint: ''
     episode_timeout: 180
     actor_addr: 'localhost:{auto}'
@@ -103,6 +108,7 @@ defaults:
   jax:
     platform: cuda
     compute_dtype: bfloat16
+    profiler: False   # JAX trace of updates 100-120 (~600MB in the logdir)
     policy_devices: [0]
     train_devices: [0]
     mock_devices: 0
@@ -331,23 +337,31 @@ offline_comp:
   <<: *size25m
   task: offline_comp
   script: train_offline
-  batch_size: 32
-  batch_length: 64
+  # v-d4rl Offline DV2 protocol (offlinedv2/train_offline.py, `dmc_vision`): the
+  # world model for 25100 updates (offline_model_train_steps 25001, in blocks of
+  # 100), then the policy for 2e5 updates (steps) on the frozen model, batch
+  # 64 x length 50 = 3200 transitions per update. The logged step counts updates.
+  # `offline_comp_joint` is the earlier joint 1e9-transition protocol.
+  batch_size: 64
+  batch_length: 50
   replay_context: 0
   run:
-    steps: 1e9
+    schedule: two_phase
+    step_unit: updates
     clock: step
-    log_every: 100000       # ~10 batches per log
-    report_every: 1000000   # ~100 batches per report
-    eval_every: 2000000    # ~500 batches per eval (~10 evals across the run)
-    env_eval_every: 2000000      # transitions between env rollouts; 0 disables
+    wm_steps: 25100
+    steps: 225100           # + 200000 policy updates
+    log_every: 1000
+    report_every: 10000     # train-split report (v-d4rl eval_every 1e4)
+    eval_every: 10000       # test-split report
+    env_eval_every: 10000   # policy updates between env rollouts; 0 disables
     env_eval_episodes: 10   # episodes per task per env-eval
     env_eval_horizon: 500  # max env steps per episode
     env_eval_max_tasks: 0  # cap tasks evaluated per split; 0 = all
     from_checkpoint: ''
   logger:
     outputs: [jsonl, wandb]
-    wandb_project: offline-comp-dreamer
+    wandb_project: offline-comp-moss
     wandb_group: composuite
     wandb_name: dreamer-offline-comp
   jax:
@@ -401,3 +415,19 @@ offline_comp_moss:
     wandb_project: offline-comp-moss
     wandb_group: composuite-moss
     wandb_name: moss-offline-comp
+
+
+# The earlier protocol: joint world model + policy updates, 1e9 transitions of
+# 32 x 64, counted in transitions. Stack after offline_comp (and offline_comp_moss).
+offline_comp_joint:
+  batch_size: 32
+  batch_length: 64
+  run:
+    schedule: joint
+    step_unit: samples
+    wm_steps: 0
+    steps: 1e9
+    log_every: 100000
+    report_every: 1000000
+    eval_every: 2000000
+    env_eval_every: 2000000

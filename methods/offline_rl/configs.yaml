@@ -1,0 +1,142 @@
+defaults:
+
+  logdir: ./logdir/{timestamp}
+  replica: 0
+  replicas: 1
+  task: offline_comp
+  seed: 42
+  script: train_offline
+  # One update consumes batch_size transitions: a window is (obs, next obs), so
+  # `steps` counts transitions and `run.*_every` below are in transitions, with
+  # the budget and log / report / eval points of methods/dreamerv3 and MoSS.
+  batch_size: 256
+  batch_length: 1
+  report_length: 1
+  replay_context: 1
+  random_agent: False
+  ipv6: False
+  errfile: False
+
+  logger:
+    outputs: [jsonl]
+    filter: 'popt/loss|copt/loss|vopt/loss|train/q|eval/mse|env_eval/.*(success|return)$|perf/'
+    timer: True
+    wandb_project: ''
+    wandb_entity: ''
+    wandb_group: ''
+    wandb_name: ''
+
+  run:
+    steps: 1e9              # 3.9M updates of 256 (iql: 0.98M of 1024)
+    clock: step
+    log_every: 100000
+    report_every: 1000000   # train-split report
+    eval_every: 2000000     # test-split report
+    env_eval_every: 2000000 # live-env rollouts; 0 disables
+    env_eval_episodes: 10   # episodes per task
+    env_eval_horizon: 500
+    env_eval_max_tasks: 0   # cap tasks evaluated per split; 0 = all
+    env_eval_slots: 1       # parallel envs per task during env eval (~0.7GB RAM each)
+    env_eval_workers: 0     # env processes; 0 = half the cpus, -1 = step envs in-process
+    from_checkpoint: ''
+    usage: {psutil: True, nvsmi: True, gputil: False, malloc: False, gc: False}
+
+  jax:
+    platform: cuda
+    compute_dtype: float32
+    profiler: False
+    policy_devices: [0]
+    train_devices: [0]
+    mock_devices: 0
+    prealloc: False
+    jit: True
+    debug: False
+    expect_devices: 0
+    enable_policy: True
+    coordinator_address: ''
+
+  agent:
+    algo: td3bc             # bc | td3bc | iql
+    layers: 3
+    units: 256
+    act: elu
+    norm: layer
+    norm_obs: True          # running mean/std observation normalization
+    actor_lr: 3e-4
+    critic_lr: 3e-4
+    value_lr: 3e-4
+    clip: 0.5               # global grad norm
+    anneal: -1              # actor cosine decay (updates): -1 = whole run, 0 = off
+    discount: 0.99
+    tau: 0.005
+    std_min: 0.01           # bc / iql gaussian policy (reference: 1e-8, 2.0, 10.0)
+    std_max: 2.0
+    mean_clip: 10.0
+    eval_stochastic: False
+    alpha: 2.5              # td3bc: BC weight (cross_embodiment_offline_rl: 0.01)
+    policy_freq: 2
+    policy_noise: 0.2
+    noise_clip: 0.5
+    expectile: 0.7          # iql
+    beta: 3.0
+    adv_clip: 100.0
+
+  data:
+    root: data/expert-panda-offline-comp-data
+    allow_overlap: false
+    sampling:
+      mode: uniform_task
+      schedule: mixed
+      eval_schedule: mixed
+      batches_per_task: 1000
+      shuffle_tasks: false
+    train: {tasks: [Panda_Box_None_PickPlace]}
+    test: {tasks: [Panda_Box_GoalWall_PickPlace]}
+
+# Recombination test shared with methods/dreamerv3 and methods/MoSS: Panda x
+# PickPlace, train on 13 of 16 object x obstacle combos, hold out 3.
+offline_comp:
+  logger:
+    outputs: [jsonl, wandb]
+    wandb_project: offline-comp-baselines
+    wandb_group: composuite
+  data:
+    train:
+      tasks:
+        - Panda_Box_None_PickPlace
+        - Panda_Box_GoalWall_PickPlace
+        - Panda_Box_ObjectDoor_PickPlace
+        - Panda_Box_ObjectWall_PickPlace
+        - Panda_Dumbbell_None_PickPlace
+        - Panda_Dumbbell_GoalWall_PickPlace
+        - Panda_Dumbbell_ObjectWall_PickPlace
+        - Panda_Plate_None_PickPlace
+        - Panda_Plate_ObjectDoor_PickPlace
+        - Panda_Plate_ObjectWall_PickPlace
+        - Panda_Hollowbox_None_PickPlace
+        - Panda_Hollowbox_GoalWall_PickPlace
+        - Panda_Hollowbox_ObjectDoor_PickPlace
+    test:
+      tasks:
+        - Panda_Dumbbell_ObjectDoor_PickPlace
+        - Panda_Plate_GoalWall_PickPlace
+        - Panda_Hollowbox_ObjectWall_PickPlace
+
+bc:
+  agent: {algo: bc}
+  logger: {wandb_name: bc-offline-comp}
+
+td3bc:
+  agent: {algo: td3bc}
+  logger: {wandb_name: td3bc-offline-comp}
+
+# cross_embodiment_offline_rl uses batch 1024 for IQL.
+iql:
+  agent: {algo: iql}
+  batch_size: 1024
+  logger: {wandb_name: iql-offline-comp}
+
+debug:
+  batch_size: 8
+  run: {steps: 2e3, log_every: 400, report_every: 800, eval_every: 800, env_eval_every: 0}
+  agent: {units: 16, layers: 1}

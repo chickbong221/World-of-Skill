@@ -25,7 +25,7 @@ class Options:
   train_devices: tuple = (0,)
   policy_mesh: str = '-1,1,1'
   train_mesh: str = '-1,1,1'
-  profiler: bool = True
+  profiler: bool = False
   expect_devices: int = 0
   use_shardmap: bool = False
   enable_policy: bool = True
@@ -145,6 +145,15 @@ class Agent(embodied.Agent):
         (dona_sharding, allo_sharding, tm, ts, ts), (tp, ts, ts, tm), ar,
         return_params=True, donate_params=True, first_outnums=(3,),
         **shared_kwargs)
+    # Optional separately compiled updates, e.g. world model then policy.
+    self.phases = tuple(getattr(self.model, 'phases', ()))
+    self._train_phase = {
+        k: transform.apply(
+            nj.pure(getattr(self.model, 'train_' + k)), self.train_mesh,
+            (dona_sharding, allo_sharding, tm, ts, ts), (tp, ts, ts, tm), ar,
+            return_params=True, donate_params=True, first_outnums=(3,),
+            **shared_kwargs)
+        for k in self.phases}
     self._report = transform.apply(
         nj.pure(self.model.report), self.train_mesh,
         (tp, tm, ts, ts), (ts, tm), ar,
@@ -261,17 +270,18 @@ class Agent(embodied.Agent):
     return carry, acts, outs
 
   @elements.timer.section('jaxagent_train')
-  def train(self, carry, data):
+  def train(self, carry, data, phase=None):
     seed = data.pop('seed')
     assert sorted(data.keys()) == sorted(self.spaces.keys()), (
         sorted(data.keys()), sorted(self.spaces.keys()))
     allo = {k: v for k, v in self.params.items() if k in self.policy_keys}
     dona = {k: v for k, v in self.params.items() if k not in self.policy_keys}
+    trainfn = self._train_phase[phase] if phase else self._train
     with self.train_lock:
       with elements.timer.section('jit_train'):
         with jax.profiler.StepTraceAnnotation(
             'train', step_num=int(self.n_updates)):
-          self.params, carry, outs, mets = self._train(
+          self.params, carry, outs, mets = trainfn(
               dona, allo, seed, carry, data)
     self.n_updates.increment()
 
@@ -396,6 +406,19 @@ class Agent(embodied.Agent):
         self.policy_params = internal.move(
             policy_params, self.policy_params_sharding)
 
+  @elements.timer.section('jaxagent_sync_policy')
+  def sync_policy(self):
+    # policy() normally refreshes the policy parameters, but offline training
+    # never calls it between updates, so without this an evaluation would use
+    # stale weights (initially the random ones).
+    if not self.jaxcfg.enable_policy:
+      return
+    with self.train_lock, self.policy_lock:
+      policy_params = {k: self.params[k].copy() for k in self.policy_keys}
+      self.policy_params = internal.move(
+          policy_params, self.policy_params_sharding)
+      self.pending_sync = None
+
   def _take_outs(self, outs):
     outs = jax.tree.map(lambda x: x.__array__(), outs)
     outs = jax.tree.map(
@@ -442,6 +465,15 @@ class Agent(embodied.Agent):
         dummy_inputs=(params, seed, carry, data),
         print_partition=(len(pr) >= 2),
     )
+    for k in getattr(self.model, 'phases', ()):  # e.g. per-phase optimizers
+      params, params_sharding = transform.init(
+          getattr(self.model, 'train_' + k), self.train_mesh,
+          (params_sharding, tm, ts, ts),
+          param_partition_rules=pr,
+          act_partition_rules=ar,
+          dummy_inputs=(params, seed, carry, data),
+          print_partition=(len(pr) >= 2),
+      )
     return params, params_sharding
 
   def _compile_train(self):
@@ -454,7 +486,13 @@ class Agent(embodied.Agent):
     carry = self.init_train(B)
     allo = {k: v for k, v in self.params.items() if k in self.policy_keys}
     dona = {k: v for k, v in self.params.items() if k not in self.policy_keys}
-    self._train = self._train.lower(dona, allo, seed, carry, data).compile()
+    if self.phases:
+      # The phases replace the joint update, whose params stay untouched.
+      self._train_phase = {
+          k: fn.lower(dona, allo, seed, carry, data).compile()
+          for k, fn in self._train_phase.items()}
+    else:
+      self._train = self._train.lower(dona, allo, seed, carry, data).compile()
 
   def _compile_report(self):
     B = self.config.batch_size
