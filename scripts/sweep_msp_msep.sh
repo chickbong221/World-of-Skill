@@ -19,6 +19,7 @@ PARALLEL=${PARALLEL:-2}
 SWEEP_ROOT=${SWEEP_ROOT:-./logdir/sweep_msp_msep}
 DRY_RUN=${DRY_RUN:-0}
 GROUP=${GROUP:-sweep-msp-msep-e8k2}
+PROJECT=${PROJECT:-offline-comp-moss}
 EXTRA=("$@")
 
 COMMON=(
@@ -28,7 +29,7 @@ COMMON=(
   --agent.offline.bc_scale 0.1
   --run.env_eval_every 50000
   --run.save_every 10000
-  --logger.wandb_project offline-comp-baselines
+  --logger.wandb_project "$PROJECT"
   --logger.wandb_group "$GROUP"
 )
 
