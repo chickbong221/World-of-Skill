@@ -1,3 +1,4 @@
+import importlib.util
 import io
 import pathlib
 import sys
@@ -10,7 +11,12 @@ ROOT = pathlib.Path(__file__).parents[2] / 'third_party' / 'tdmpc2' / 'tdmpc2'
 sys.path.insert(0, str(ROOT))  # TD-MPC2 imports its modules as `common.*`
 from common import MODEL_SIZE, math  # noqa: E402
 from common.parser import cfg_to_dataclass  # noqa: E402
-from tdmpc2 import TDMPC2  # noqa: E402
+
+# Loaded by path: this package is also named tdmpc2.
+_spec = importlib.util.spec_from_file_location('tdmpc2_official', ROOT / 'tdmpc2.py')
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+TDMPC2 = _mod.TDMPC2
 
 
 def make_cfg(config, obs_dim, act_dim):
