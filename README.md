@@ -202,6 +202,48 @@ the two methods.
 
 Stack `offline_dv2` after the configs for the previous default below.
 
+## Model-based Baselines (C-LAP, TD-MPC2)
+
+`scripts/get_baselines.sh` fetches the official code into `third_party/`
+(C-LAP @ e1616be, TD-MPC2 @ e9f5932). `methods/clap` and `methods/tdmpc2` drive
+it from the same offline loop, data, split, live-env evaluation and logging:
+
+```bash
+python methods/clap/main.py --configs offline_comp
+python methods/tdmpc2/main.py --configs offline_comp
+```
+
+- C-LAP (Alles et al., NeurIPS 2024): its `c-lap.yaml` (D4RL state setting):
+  latent-action RSSM trained first, then the constrained latent-action agent on
+  the frozen model, batch 64 windows of 50 transitions, observations
+  standardised with the dataset mean / std. Its 500K + 500K updates are capped at
+  300K + 300K. `latent_action_std_scaling` 3.0 (the config default; the paper
+  tunes it per dataset in {0.5, 1, 2, 3}).
+- TD-MPC2 (Hansen et al., ICLR 2024): its own joint update and MPPI planner
+  (batched over the evaluation envs), 19M model, batch 1024 as in its multi-task
+  offline recipe, single-task style on the pooled train tasks since the task is
+  in the observation; 300K updates (its offline default is 10M).
+- Both drop the windows that cross an episode boundary and clip the recorded
+  actions to the executed [-1, 1].
+
+## H100 Cluster (H100-duong)
+
+Everything lives under `/mnt/data/duongnm2`: code (`World-of-Skill`, branch
+`offline`), env `envs/wos` (a clone of `dreamer` plus robosuite 1.4,
+`envs/setup_wos.sh`), data, logdirs (`logdir/world-of-skill/<method>_<job>`),
+wandb files and SLURM logs (`output/`). Each sweep runs 2 methods one after
+another on one MIG 3g.40gb slice and logs to wandb `offline-comp-baselines`:
+
+```bash
+sbatch scripts/slurm_sweep_ours.sh       # LEQ, then MoSS
+sbatch scripts/slurm_sweep_baselines.sh  # C-LAP, then TD-MPC2
+```
+
+The data comes from the public Hugging Face copy of the 16 Panda x PickPlace
+tasks (`hf download TuanDepZai/composuite-offline-expert-panda --repo-type
+dataset --local-dir /mnt/data/duongnm2/data/expert-panda-offline-comp-data`);
+the cluster cannot reach Dryad's storage.
+
 ## Offline DV2 Schedule (v-d4rl)
 
 `--configs offline_comp offline_dv2` (MoSS: `offline_comp offline_comp_moss
