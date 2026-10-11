@@ -11,3 +11,4 @@ CompoSuite/
 offline-compositional-rl-datasets/
 logdir/
 ;
+third_party/

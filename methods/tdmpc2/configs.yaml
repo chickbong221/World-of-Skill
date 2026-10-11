@@ -1,0 +1,103 @@
+defaults:
+
+  logdir: ./logdir/{timestamp}
+  replica: 0
+  replicas: 1
+  task: offline_comp
+  seed: 42
+  script: train_offline
+  # One update is one TD-MPC2 update (agent.batch_size windows of horizon + 1
+  # records). The data batch carries a margin for the windows that cross an
+  # episode boundary, which are dropped. `steps` and `run.*_every` count updates.
+  batch_size: 1056
+  batch_length: 4
+  report_length: 4
+  replay_context: 0
+  random_agent: False
+  ipv6: False
+  errfile: False
+
+  logger:
+    outputs: [jsonl]
+    filter: 'total_loss|value_loss|pi_loss|env_eval/.*(success|return)$|perf/'
+    timer: True
+    wandb_project: ''
+    wandb_entity: ''
+    wandb_group: ''
+    wandb_name: ''
+
+  run:
+    step_unit: updates
+    steps: 300000
+    clock: step
+    log_every: 1000
+    report_every: 0
+    eval_every: 0
+    env_eval_every: 10000   # live-env rollouts; 0 disables
+    env_eval_episodes: 10   # episodes per task
+    env_eval_horizon: 500
+    env_eval_max_tasks: 0   # cap tasks evaluated per split; 0 = all
+    env_eval_slots: 1
+    env_eval_workers: 0     # env processes; 0 = half the cpus, -1 = in-process
+    from_checkpoint: ''
+    save_every: 900         # seconds between checkpoints
+    usage: {psutil: True, nvsmi: True, gputil: False, malloc: False, gc: False}
+
+  jax:
+    platform: cuda
+
+  # TD-MPC2's own config.yaml (third_party/tdmpc2) with these overrides. Its
+  # multi-task offline recipe uses batch 1024; 19M is the size closest to the
+  # world models of LEQ / MoSS. Single-task style: the task is in the observation.
+  agent:
+    model_size: 19
+    batch_size: 1024
+    compile: True
+    episode_length: 500
+
+  data:
+    root: data/expert-panda-offline-comp-data
+    allow_overlap: false
+    sampling:
+      mode: uniform_task
+      schedule: mixed
+      eval_schedule: mixed
+      batches_per_task: 1000
+      shuffle_tasks: false
+    train: {tasks: [Panda_Box_None_PickPlace]}
+    test: {tasks: [Panda_Box_GoalWall_PickPlace]}
+
+# Recombination test shared with the other methods: Panda x PickPlace, train on
+# 13 of 16 object x obstacle combos, hold out 3.
+offline_comp:
+  logger:
+    outputs: [jsonl, wandb]
+    wandb_project: offline-comp-baselines
+    wandb_group: composuite
+    wandb_name: TD-MPC2
+  data:
+    train:
+      tasks:
+        - Panda_Box_None_PickPlace
+        - Panda_Box_GoalWall_PickPlace
+        - Panda_Box_ObjectDoor_PickPlace
+        - Panda_Box_ObjectWall_PickPlace
+        - Panda_Dumbbell_None_PickPlace
+        - Panda_Dumbbell_GoalWall_PickPlace
+        - Panda_Dumbbell_ObjectWall_PickPlace
+        - Panda_Plate_None_PickPlace
+        - Panda_Plate_ObjectDoor_PickPlace
+        - Panda_Plate_ObjectWall_PickPlace
+        - Panda_Hollowbox_None_PickPlace
+        - Panda_Hollowbox_GoalWall_PickPlace
+        - Panda_Hollowbox_ObjectDoor_PickPlace
+    test:
+      tasks:
+        - Panda_Dumbbell_ObjectDoor_PickPlace
+        - Panda_Plate_GoalWall_PickPlace
+        - Panda_Hollowbox_ObjectWall_PickPlace
+
+debug:
+  batch_size: 72
+  agent: {model_size: 1, batch_size: 64, compile: False}
+  run: {steps: 200, log_every: 100, env_eval_every: 100, env_eval_episodes: 1, env_eval_max_tasks: 1, env_eval_workers: -1}

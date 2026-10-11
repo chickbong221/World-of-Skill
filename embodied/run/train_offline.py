@@ -56,6 +56,8 @@ def train_offline(make_agent, make_logger, args):
           seed=args.seed, logdir=args.logdir))
   try:
     agent = make_agent(train_data.obs_space, train_data.act_space)
+    if hasattr(agent, 'fit_data'):  # e.g. dataset statistics (methods/clap)
+      agent.fit_data(train_data)
     logger = make_logger()
     step = logger.step
     usage = elements.Usage(**args.usage)

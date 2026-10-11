@@ -102,6 +102,14 @@ class OfflineCompDataset:
     self._steps = np.arange(self.sequence_length)
     self._reset_task_order()
 
+  def obs_stats(self):
+    """Mean and std of the observations of this dataset's tasks."""
+    rows = [self.store.obs[s:s + n] for s, n in zip(self.base, self.lengths)]
+    count = sum(len(r) for r in rows)
+    mean = sum(r.sum(0, dtype=np.float64) for r in rows) / count
+    var = sum(np.square(r - mean).sum(0) for r in rows) / count
+    return mean.astype(np.float32), np.sqrt(var).astype(np.float32)
+
   @classmethod
   def from_config(cls, data_config, split, sequence_length, seed=0):
     root = _get(data_config, "root")
