@@ -362,7 +362,7 @@ offline_comp:
     from_checkpoint: ''
   logger:
     outputs: [jsonl, wandb]
-    wandb_project: offline-comp-dreamer
+    wandb_project: offline-comp-moss
     wandb_group: composuite
     wandb_name: dreamer-offline-comp
   jax:
