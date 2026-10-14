@@ -36,8 +36,16 @@ class Agent(embodied.jax.Agent):
     self.config = config
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
-    enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
-    dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
+    # enc_labels feeds task_id/task_axes to the encoder. Live env evaluation
+    # passes task_id = 0 for every task, so a model trained with enc_labels
+    # sees a wrong id there; the revised protocol turns it off, matching MoSS.
+    labels = ('task_id', 'task_axes')
+    enc_ex = exclude + (() if config.get('enc_labels', True) else labels)
+    dec_ex = exclude + (() if config.get('decode_labels', True) else labels)
+    enc_space = {k: v for k, v in obs_space.items() if k not in enc_ex}
+    dec_space = {k: v for k, v in obs_space.items() if k not in dec_ex}
+    self.obs_keep = parse_obs_mask(
+        config.get('mask_obs', ''), obs_space.get('vector'))
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
@@ -76,6 +84,19 @@ class Agent(embodied.jax.Agent):
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
+
+    # schedule two_phase: world model first, then the policy on the frozen
+    # model, each with its own optimizer (v-d4rl Offline DV2).
+    self.phases = ()
+    if config.get('schedule', 'joint') == 'two_phase':
+      assert not config.replay_context, 'two_phase needs replay_context 0'
+      self.phases = ('wm', 'policy')
+      self.opt_wm = embodied.jax.Optimizer(
+          [self.dyn, self.enc, self.dec, self.rew, self.con],
+          self._make_opt(**config.opt), summary_depth=1, name='opt_wm')
+      self.opt_ac = embodied.jax.Optimizer(
+          [self.pol, self.val], self._make_opt(**config.opt),
+          summary_depth=1, name='opt_ac')
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
@@ -116,7 +137,14 @@ class Agent(embodied.jax.Agent):
   def init_report(self, batch_size):
     return self.init_policy(batch_size)
 
+  def _mask_obs(self, obs):
+    if self.obs_keep is None or 'vector' not in obs:
+      return obs
+    keep = jnp.asarray(self.obs_keep, obs['vector'].dtype)
+    return {**obs, 'vector': obs['vector'] * keep}
+
   def policy(self, carry, obs, mode='train'):
+    obs = self._mask_obs(obs)
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
     kw = dict(training=False, single=True)
     reset = obs['is_first']
@@ -138,7 +166,27 @@ class Agent(embodied.jax.Agent):
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
     return carry, act, out
 
+  def train_wm(self, carry, data):
+    return self._train_phase(carry, data, 'wm')
+
+  def train_policy(self, carry, data):
+    return self._train_phase(carry, data, 'policy')
+
+  def _train_phase(self, carry, data, phase):
+    carry, obs, prevact, dataact, _ = self._apply_replay_context(carry, data)
+    opt = self.opt_wm if phase == 'wm' else self.opt_ac
+    metrics, (carry, _, _, mets) = opt(
+        self.loss, carry, obs, prevact, dataact, training=True, phase=phase,
+        has_aux=True)
+    metrics.update(mets)
+    if phase == 'policy':
+      self.slowval.update()
+    carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
+    return carry, {}, metrics
+
   def train(self, carry, data):
+    if self.phases:  # only creates the variables of the phase updates
+      return self.train_wm(carry, data)
     carry, obs, prevact, dataact, stepid = self._apply_replay_context(carry, data)
     metrics, (carry, entries, outs, mets) = self.opt(
         self.loss, carry, obs, prevact, dataact, training=True, has_aux=True)
@@ -157,42 +205,60 @@ class Agent(embodied.jax.Agent):
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
-  def loss(self, carry, obs, prevact, dataact, training):
+  def loss(self, carry, obs, prevact, dataact, training, phase='all'):
+    # phase: 'all' = every loss (joint update and reports), 'wm' = world model
+    # losses only, 'policy' = actor-critic losses on the frozen world model.
+    obs = self._mask_obs(obs)
     enc_carry, dyn_carry, dec_carry = carry
     reset = obs['is_first']
     B, T = reset.shape
     losses = {}
     metrics = {}
 
-    # World model
+    def finish(keys):
+      assert keys <= set(self.scales), (sorted(keys), sorted(self.scales))
+      metrics.update({f'loss/{k}': losses[k].mean() for k in keys})
+      loss = sum([losses[k].mean() * self.scales[k] for k in keys])
+      carry = (enc_carry, dyn_carry, dec_carry)
+      entries = (enc_entries, dyn_entries, dec_entries)
+      outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
+      return loss, (carry, entries, outs, metrics)
+
+    # World model; the policy phase only reads its posterior states.
+    wmtrain = training and phase != 'policy'
     enc_carry, enc_entries, tokens = self.enc(
-        enc_carry, obs, reset, training)
+        enc_carry, obs, reset, wmtrain)
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
-        dyn_carry, tokens, prevact, reset, training)
+        dyn_carry, tokens, prevact, reset, wmtrain)
     losses.update(los)
     metrics.update(mets)
-    dec_carry, dec_entries, recons = self.dec(
-        dec_carry, repfeat, reset, training)
-    inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
-    losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
-    con = f32(~obs['is_terminal'])
-    if self.config.contdisc:
-      con *= 1 - 1 / self.config.horizon
-    losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
-    for key, recon in recons.items():
-      space, value = self.obs_space[key], obs[key]
-      assert value.dtype == space.dtype, (key, space, value.dtype)
-      if isimage(space):
-        scale = 255.0 if space.dtype == np.uint8 else float(
-            np.asarray(space.high).max())
-        target = f32(value) / scale
-      else:
-        target = value
-      losses[key] = recon.loss(sg(target))
+    dec_entries = {}
+    if phase != 'policy':
+      dec_carry, dec_entries, recons = self.dec(
+          dec_carry, repfeat, reset, training)
+      inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
+      losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
+      con = f32(~obs['is_terminal'])
+      if self.config.contdisc:
+        con *= 1 - 1 / self.config.horizon
+      losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+      for key, recon in recons.items():
+        space, value = self.obs_space[key], obs[key]
+        assert value.dtype == space.dtype, (key, space, value.dtype)
+        if isimage(space):
+          scale = 255.0 if space.dtype == np.uint8 else float(
+              np.asarray(space.high).max())
+          target = f32(value) / scale
+        else:
+          target = value
+        losses[key] = recon.loss(sg(target))
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
+    wm_keys = set(losses)
+    if phase == 'wm':
+      return finish(wm_keys)
 
     # Imagination
     K = min(self.config.imag_last or T, T)
@@ -249,15 +315,11 @@ class Agent(embodied.jax.Agent):
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
 
+    if phase == 'policy':
+      return finish(set(losses) - wm_keys)
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
-    metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
-    loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
-
-    carry = (enc_carry, dyn_carry, dec_carry)
-    entries = (enc_entries, dyn_entries, dec_entries)
-    outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
-    return loss, (carry, entries, outs, metrics)
+    return finish(set(losses))
 
   def report(self, carry, data):
     if not self.config.report:
@@ -422,6 +484,30 @@ class Agent(embodied.jax.Agent):
       sched = optax.join_schedules([ramp, sched], [warmup])
     chain.append(optax.scale_by_learning_rate(sched))
     return optax.chain(*chain)
+
+
+def parse_obs_mask(spec, space):
+  """Keep-mask (D,) float32 for the `vector` observation, or None.
+  Same format as methods/MoSS/agent.py: '' or e.g. '77:93' / '0,3,10:12'."""
+  spec = str(spec or '').strip()
+  if not spec:
+    return None
+  assert space is not None, 'mask_obs needs a `vector` observation'
+  dim = int(space.shape[-1])
+  keep = np.ones(dim, np.float32)
+  for part in spec.split(','):
+    part = part.strip()
+    if not part:
+      continue
+    if ':' in part:
+      lo, hi = part.split(':')
+      keep[slice(int(lo) if lo else 0, int(hi) if hi else dim)] = 0.0
+    else:
+      keep[int(part)] = 0.0
+  assert keep.min() == 0.0, f'mask_obs {spec!r} masks nothing'
+  print(f'[mask_obs] hiding {int((keep == 0).sum())} of {dim} vector dims: '
+        f'{spec}')
+  return keep
 
 
 def imag_loss(

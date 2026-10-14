@@ -2,126 +2,37 @@ import time
 
 import elements
 import embodied
-import numpy as np
 
 from offline_comp.dataset import make_datasets
 
-
-def _run_env_eval(agent, tasks, episodes, horizon, max_tasks):
-  """Roll out `agent.policy` in live CompoSuite envs and return metrics.
-
-  Runs `episodes` episodes per task (capped at `max_tasks` tasks) and
-  aggregates per-task and mean success_once / success_at_end / return.
-  """
-  from embodied.envs.offline_comp import CompoSuiteEval
-
-  if max_tasks and max_tasks > 0:
-    tasks = list(tasks)[:max_tasks]
-  else:
-    tasks = list(tasks)
-
-  per_task = {}
-  agg_ret, agg_once, agg_end = [], [], []
-  for task in tasks:
-    env = CompoSuiteEval(
-        task.robot, task.obj, task.obstacle, task.objective,
-        horizon=horizon)
-    try:
-      returns, once, ends = _rollout(agent, env, episodes, task)
-    finally:
-      env.close()
-    per_task[task.name] = {
-        'return': float(np.mean(returns)) if returns else 0.0,
-        'success_once': float(np.mean(once)) if once else 0.0,
-        'success_at_end': float(np.mean(ends)) if ends else 0.0,
-    }
-    agg_ret.extend(returns)
-    agg_once.extend(once)
-    agg_end.extend(ends)
-
-  metrics = {}
-  if agg_ret:
-    metrics['return'] = float(np.mean(agg_ret))
-    metrics['success_once'] = float(np.mean(agg_once))
-    metrics['success_at_end'] = float(np.mean(agg_end))
-    metrics['tasks_evaluated'] = float(len(tasks))
-  for name, values in per_task.items():
-    for key, value in values.items():
-      metrics[f'tasks/{name}/{key}'] = value
-  return metrics
+from . import env_eval
 
 
-def _rollout(agent, env, episodes, task=None):
-  """Run `episodes` episodes in `env` under `agent.policy(mode='eval')`."""
-  carry = agent.init_policy(1)
-  action_shape = env.act_space['action'].shape
-  reset_action = {
-      'action': np.zeros(action_shape, np.float32),
-      'reset': True,
-  }
-  obs = env.step(reset_action)
-  # MoSS: agent.policy() asserts obs.keys() == obs_space.keys(), and
-  # obs_space now carries task ids. The policy does not consume them (they
-  # are excluded from the encoder); they only need to be present and finite.
-  extra = {}
-  if getattr(agent, 'obs_space', None) and 'task_id' in agent.obs_space:
-    from offline_comp import tasks as tasks_mod
-    tid = 0
-    axes = np.zeros((4,), np.int32)
-    if task is not None:
-      axes = np.array([
-          tasks_mod.ROBOTS.index(task.robot),
-          tasks_mod.OBJECTS.index(task.obj),
-          tasks_mod.OBSTACLES.index(task.obstacle),
-          tasks_mod.OBJECTIVES.index(task.objective),
-      ], np.int32)
-    extra = {
-        'task_id': np.asarray(tid, np.int32)[None],
-        'task_axes': axes[None],
-    }
+class Timed:
+  """Stream wrapper that accumulates the time spent waiting for batches."""
 
-  returns, once, ends = [], [], []
-  ep_return = 0.0
-  ep_success_once = False
-  ep_last_success = 0.0
-  while len(returns) < episodes:
-    log_success = float(obs.get('log/success', 0.0))
-    ep_last_success = log_success
-    if log_success > 0.5:
-      ep_success_once = True
-    policy_obs = {
-        k: np.asarray(v)[None] for k, v in obs.items()
-        if not k.startswith('log/')}
-    policy_obs.update(extra)
-    carry, acts, _ = agent.policy(carry, policy_obs, mode='eval')
-    act = {k: np.asarray(v)[0] for k, v in acts.items()}
-    act['reset'] = False
-    obs = env.step(act)
-    ep_return += float(obs['reward'])
-    if bool(obs['is_last']):
-      log_success = float(obs.get('log/success', 0.0))
-      ep_last_success = log_success
-      if log_success > 0.5:
-        ep_success_once = True
-      returns.append(ep_return)
-      once.append(1.0 if ep_success_once else 0.0)
-      ends.append(ep_last_success)
-      ep_return = 0.0
-      ep_success_once = False
-      ep_last_success = 0.0
-      if len(returns) < episodes:
-        obs = env.step(reset_action)
-  return returns, once, ends
+  def __init__(self, stream):
+    self.stream = stream
+    self.wait = 0.0
+
+  def __iter__(self):
+    return self
+
+  def __next__(self):
+    start = time.perf_counter()
+    batch = next(self.stream)
+    self.wait += time.perf_counter() - start
+    return batch
 
 
 class StepClock:
   """Step-based analogue of embodied.LocalClock: fires once step advances by
   at least `every` since the previous fire. `every <= 0` disables the clock."""
 
-  def __init__(self, every, first=False):
+  def __init__(self, every, first=False, start=None):
     self.every = int(every)
     self.first = first
-    self.prev = None
+    self.prev = start
 
   def __call__(self, step):
     if self.every <= 0:
@@ -136,26 +47,60 @@ class StepClock:
     return False
 
 
+def route_mass(mets, prefix, tasks):
+  """Turns the MoSS per-task router mass sums and counts into mean soft mass
+  per (task, expert), keyed by task name: <prefix>moss_route/<task>/e<m>.
+  Tasks absent from the window are dropped instead of logged as 0."""
+  sums = f'{prefix}moss_route_sum/t'
+  cnts = f'{prefix}moss_route_cnt/t'
+  if not any(k.startswith(sums) for k in mets):
+    return mets
+  mets = dict(mets)
+  cnt = {k[len(cnts):]: mets.pop(k) for k in list(mets) if k.startswith(cnts)}
+  for key in [k for k in mets if k.startswith(sums)]:
+    value = mets.pop(key)
+    task, expert = key[len(sums):].split('/')
+    k, n = int(task), float(cnt.get(task, 0))
+    if k < len(tasks) and n > 0:
+      mets[f'{prefix}moss_route/{tasks[k].name}/{expert}'] = float(value) / n
+  return mets
+
+
 def train_offline(make_agent, make_logger, args):
-  train_data, train_report_data, test_report_data, train_tasks, test_tasks = (
-      make_datasets(
-          args.data,
-          args.batch_length + args.replay_context,
-          args.report_length + args.replay_context,
-          seed=args.seed, logdir=args.logdir))
+  (train_data, train_report_data, test_report_data, train_tasks, test_tasks,
+   val_data) = make_datasets(
+       args.data,
+       args.batch_length + args.replay_context,
+       args.report_length + args.replay_context,
+       seed=args.seed, logdir=args.logdir, return_val=True)
   try:
     agent = make_agent(train_data.obs_space, train_data.act_space)
     logger = make_logger()
     step = logger.step
     usage = elements.Usage(**args.usage)
     train_agg = elements.Agg()
-    batch_steps = args.batch_size * args.batch_length
-    clock_mode = getattr(args, 'clock', 'time')
-    Clock = StepClock if clock_mode == 'step' else embodied.LocalClock
+    per_update = args.batch_size * args.batch_length
+    unit = getattr(args, 'step_unit', 'samples')  # 'updates': step counts updates
+    batch_steps = 1 if unit == 'updates' else per_update
+    if getattr(args, 'clock', 'time') == 'step':
+      Clock = lambda every: StepClock(
+          every, start=0 if unit == 'updates' else None)
+    else:
+      Clock = embodied.LocalClock
+    # two_phase: world model for wm_steps updates, then the policy.
+    phased = getattr(args, 'schedule', 'joint') == 'two_phase'
+    wm_steps = int(args.wm_steps) if phased else 0
+    assert not phased or unit == 'updates', 'two_phase counts updates'
     should_log = Clock(args.log_every)
     should_report = Clock(args.report_every)
     should_eval = Clock(args.eval_every)
+    # Validation: held-out rows of the train tasks (data.val_frac). This is
+    # what sweeps and checkpoint choices should use; `eval/` is the test split.
+    should_val = Clock(getattr(args, 'val_every', 0) or args.eval_every)
     should_env_eval = Clock(getattr(args, 'env_eval_every', 0))
+    # Checkpoints for resuming, in the same unit as the other clocks; <= 0
+    # disables them (offline runs saved none before).
+    should_save = Clock(getattr(args, 'save_every', 0))
 
     train_stream = embodied.streams.Stateless(
         lambda: train_data.sample(args.batch_size))
@@ -163,9 +108,14 @@ def train_offline(make_agent, make_logger, args):
         lambda: train_report_data.sample(args.batch_size))
     test_report_stream = embodied.streams.Stateless(
         lambda: test_report_data.sample(args.batch_size))
-    train_stream = iter(agent.stream(train_stream))
+    train_stream = Timed(iter(agent.stream(train_stream)))
+    perf = [time.time(), 0.0, 0]  # time, data wait and step at the last log
     train_report_stream = iter(agent.stream(train_report_stream))
     test_report_stream = iter(agent.stream(test_report_stream))
+    val_stream = None
+    if val_data is not None:
+      val_stream = iter(agent.stream(embodied.streams.Stateless(
+          lambda: val_data.sample(args.batch_size))))
     carry_train = agent.init_train(args.batch_size)
     carry_report = agent.init_report(args.batch_size)
 
@@ -180,12 +130,20 @@ def train_offline(make_agent, make_logger, args):
 
     print("Offline CompoSuite train tasks:", len(train_tasks))
     print("Offline CompoSuite test tasks:", len(test_tasks))
+    if val_data is not None:
+      print("Validation: last", f"{val_data.span[1] - val_data.span[0]:.0%}",
+            "of every train task's rows")
     print("Start offline Dreamer training loop")
     start = time.time()
 
     while step < args.steps:
+      phase = ('wm' if int(step) < wm_steps else 'policy') if phased else None
+      if phased and int(step) == wm_steps:
+        print(f"[phase] world model trained for {wm_steps} updates, "
+              f"training the policy on it for {int(args.steps) - wm_steps}")
       batch = next(train_stream)
-      carry_train, outs, mets = agent.train(carry_train, batch)
+      carry_train, outs, mets = agent.train(
+          carry_train, batch, **({'phase': phase} if phased else {}))
       if "replay" in outs:
         pass
       train_agg.add(mets, prefix="train")
@@ -194,7 +152,7 @@ def train_offline(make_agent, make_logger, args):
       if should_eval(step):
         carry_report, mets = agent.report(
             carry_report, next(test_report_stream))
-        logger.add(mets, prefix="eval")
+        logger.add(route_mass(mets, '', test_tasks), prefix="eval")
         logger.add({
             "tasks/train": len(train_tasks),
             "tasks/test": len(test_tasks),
@@ -204,9 +162,15 @@ def train_offline(make_agent, make_logger, args):
       if should_report(step):
         carry_report, mets = agent.report(
             carry_report, next(train_report_stream))
-        logger.add(mets, prefix="report")
+        logger.add(route_mass(mets, '', train_tasks), prefix="report")
 
-      if should_env_eval(step):
+      if val_stream is not None and should_val(step):
+        carry_report, mets = agent.report(carry_report, next(val_stream))
+        logger.add(route_mass(mets, '', train_tasks), prefix="val")
+
+      # Env evals follow the policy updates only (all updates when joint).
+      pstep = int(step) - wm_steps
+      if pstep > 0 and should_env_eval(pstep):
         episodes = int(getattr(args, 'env_eval_episodes', 0) or 0)
         horizon = int(getattr(args, 'env_eval_horizon', 500) or 500)
         max_tasks = int(getattr(args, 'env_eval_max_tasks', 0) or 0)
@@ -217,16 +181,17 @@ def train_offline(make_agent, make_logger, args):
               f"{episodes} eps x <= {max_tasks or len(train_tasks)} train "
               f"and <= {max_tasks or len(test_tasks)} test tasks")
           try:
-            train_mets = _run_env_eval(
-                agent, train_tasks, episodes, horizon, max_tasks)
-            test_mets = _run_env_eval(
-                agent, test_tasks, episodes, horizon, max_tasks)
-            logger.add(train_mets, prefix='env_eval/train')
-            logger.add(test_mets, prefix='env_eval/test')
+            ev = env_eval.evaluate(
+                agent, {'train': train_tasks, 'test': test_tasks},
+                episodes, horizon, max_tasks,
+                slots=getattr(args, 'env_eval_slots', 1),
+                workers=getattr(args, 'env_eval_workers', 0))
+            logger.add(ev['train'], prefix='env_eval/train')
+            logger.add(ev['test'], prefix='env_eval/test')
             print(
                 f"[env_eval] done in {time.time() - eval_start:.1f}s | "
-                f"train success_once={train_mets.get('success_once', 0.0):.2f} "
-                f"test success_once={test_mets.get('success_once', 0.0):.2f}")
+                f"train success_once={ev['train'].get('success_once', 0.0):.2f} "
+                f"test success_once={ev['test'].get('success_once', 0.0):.2f}")
           except Exception as exc:
             import traceback
             print(f"[env_eval] FAILED after {time.time() - eval_start:.1f}s: "
@@ -234,15 +199,33 @@ def train_offline(make_agent, make_logger, args):
             traceback.print_exc()
 
       if should_log(step):
-        logger.add(train_agg.result())
+        now, wait = time.time(), train_stream.wait
+        span = max(now - perf[0], 1e-6)
+        logger.add({
+            "steps_per_sec": (int(step) - perf[2]) / span,
+            "data_wait_frac": (wait - perf[1]) / span,
+        }, prefix="perf")
+        perf[:] = [now, wait, int(step)]
+        updates = int(step) if unit == 'updates' else int(step) // per_update
+        count = {"updates": updates, "transitions": updates * per_update}
+        if phased:
+          count["policy_updates"] = max(updates - wm_steps, 0)
+          count["phase_policy"] = float(updates > wm_steps)
+        logger.add(count, prefix="offline")
+        logger.add(route_mass(train_agg.result(), 'train/', train_tasks))
         logger.add(train_data.stats(), prefix="dataset/train")
         logger.add(test_report_data.stats(), prefix="dataset/test")
         logger.add(usage.stats(), prefix="usage")
         logger.add({"timer": elements.timer.stats()["summary"]})
         logger.write()
 
+      if should_save(step):
+        cp.save()
+
     logger.close()
   finally:
     train_data.close()
     train_report_data.close()
     test_report_data.close()
+    if val_data is not None:
+      val_data.close()
