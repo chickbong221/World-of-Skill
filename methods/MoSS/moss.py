@@ -605,6 +605,11 @@ class MoSSRSSM(nj.Module):
     metrics['moss_router_lse'] = jax.nn.logsumexp(rlogit, -1).mean()
     metrics['moss_lambda'] = lam
     metrics['moss_dis'] = f32(feat['dis']).mean()
+    # ninjax differentiates every variable of the optimized modules and
+    # requires each to be accessed in the differentiated call. cstep is
+    # otherwise only touched in the policy phase (dbar_calib), so read it
+    # here to keep the world-model and joint updates valid.
+    metrics['moss_calib_steps'] = self.cstep.read()
     return carry, entries, losses, feat, metrics
 
   def _task_sums(self, mass, task_id, training):
