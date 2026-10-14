@@ -13,25 +13,41 @@ Backbone        The DreamerV3 RSSM. Model state s_t = [h_t, z_t]; posterior
 Experts         The sequence model is routed: each expert owns a block-GRU and
                 proposes h_t^(m); the mixture h_t = sum_m pi~_m h_t^(m)
                 = h_{t-1} + sum_m pi~_m (h_t^(m) - h_{t-1}).
+Routing         Clean logits g = W_r[sg stem]. During world-model training the
+                Top-k SELECTION uses g + sigma(s) eps with a fixed schedule
+                annealed to 0; the mixture WEIGHTS always use softmax(g)
+                renormalized over the selected set (noise_impl 'select').
+                Imagination and evaluation use the noise-free set.
 L_exp           Every active expert must explain the posterior on its own:
                 KL[sg q || p(. | h_t^(m))]  (free nats as in L_dyn).
+L_comp          Competitive router loss (Jacobs et al., 1991):
+                -log sum_m pi~_m exp(-KL_m / tau) over the active set, plus the
+                same over all experts (dense, free here because every expert is
+                computed). Trains the router only; pulls it toward the
+                per-transition posterior over experts.
+L_sep           Environment-expert objective -H(E) + sum_g P(g)[H(E|g) - log s]_+
+                on the clean softmax masked to the noise-free active set
+                (sep_impl 'hinge'); 'plain' is the earlier -I(task; expert).
+L_z             Router z-loss on the clean logits (ST-MoE).
 Responsibility  Skill-score error (paper Eq. 8 analogue): the expert's KL
                 divided by the KL of a persistence forecast p(. | h_{t-1}),
-                i.e. the fraction of the latent surprise it fails to explain.
-L_sub           Residual invariance. An RSSM has no observation-conditioned
-                deterministic target, so the residual lives in z-space: the
+                computed on the noise-free active set (stats_routing 'clean').
+L_sub           Residual invariance. The residual lives in z-space: the
                 randomized probability integral transform (PIT) of the
                 posterior sample under the routed prior. If the routed prior is
-                the true conditional distribution, the PIT is exactly
-                Uniform(0,1)^S whatever states/actions an environment visits,
-                so responsible environments must have equal residual laws.
-                The residual of expert m uses the routed (mixture) prior with
-                the other experts detached, so it is correct for k >= 2, and a
-                param-cancelling trick keeps L_sub gradients out of the shared
-                prior head: only expert m is trained by its pair terms.
-Uncertainty     Disagreement of co-active experts (paper Eq. 28), normalised by
-                a running per-environment percentile; the agent subtracts the
-                hinge penalty from imagined rewards.
+                the true conditional distribution, each PIT coordinate is
+                Uniform(0,1) whatever states/actions an environment visits, so
+                responsible environments must have equal residual laws. The
+                MMD weights residuals by pi~ and is normalized by a running
+                total of the pair weights (sub_norm 'running').
+Uncertainty     Equal-weight disagreement of the noise-free active experts
+                (paper Eq. 28). Its per-environment 95th percentile d_bar is
+                re-estimated on the frozen model during the first `dbar_calib`
+                policy-phase updates; the agent subtracts the hinge penalty
+                from imagined rewards.
+
+Every revised choice keeps its earlier behaviour behind a flag, see the
+`offline_comp_legacy` preset in configs.yaml.
 """
 
 import elements
@@ -45,19 +61,28 @@ import numpy as np
 
 from embodied.jax import internal
 
+from . import moss_math
+
 f32 = jnp.float32
 i32 = jnp.int32
 sg = jax.lax.stop_gradient
 
+# Kept for embodied/tests/test_moss_sep.py and scripts that import it here.
+route_mi = moss_math.route_mi
+
 
 # Single source of truth for the MoSS loss keys. `Agent.loss` asserts
 # set(losses) == set(scales), so these MUST match the keys written in `loss`.
+# Values are the revised defaults; configs.yaml may override them.
 DEFAULT_SCALES = dict(
-    mexp=0.5,     # per-expert prior KL
+    mexp=0.1,     # per-expert prior KL
     msub=1.0,     # residual (PIT) invariance between responsible env pairs
-    mdiv=1.0,     # expert feature decorrelation (batch-invariant)
-    msp=0.001,    # routing mass on the active set
-    mbal=0.01,    # balanced soft routing mass
+    mcomp=0.1,    # competitive router loss (router only)
+    msep=1.0,     # environment-expert objective (hinge by default)
+    mz=0.001,     # router z-loss (router only)
+    mdiv=0.0,     # legacy: expert feature decorrelation
+    msp=0.0,      # legacy: routing mass on the active set
+    mbal=0.0,     # legacy: balanced soft routing mass
     mrew=1.0,     # per-expert reward head        (only if expert_heads)
     mcon=1.0,     # per-expert continuation head  (only if expert_heads)
 )
@@ -95,15 +120,25 @@ class MoSSRSSM(nj.Module):
   experts: int = 8              # M
   topk: int = 2                 # k (>= 2 so normalized weights get gradient)
   zdim: int = 128               # expert feature dim (used by L_div)
-  router_noise: bool = True     # noisy top-k gating, off in imagination
+  router_noise: bool = True     # exploration noise in WM training only
+  noise_impl: str = 'select'    # 'select' (revised) | 'learned' (legacy)
+  noise_scale: float = 1.0      # sigma_0 of the 'select' schedule
+  noise_steps: int = 20000      # T_clean: sigma(s) reaches 0 here (0: const)
   dense_warmup: bool = False    # legacy: all experts active during warm-up
   expert_heads: bool = False    # legacy: per-expert reward/cont heads
+
+  # --- Router objective ---
+  comp_dense: bool = True       # add the all-experts part of L_comp
+  sep_impl: str = 'hinge'       # 'hinge' (revised) | 'plain' (-I, legacy)
+  sep_target: float = 0.0       # s_env of the hinge; 0 -> topk
+  sep_ramp: bool = True         # ramp L_sep in over warm_steps
 
   # --- Predictive responsibility ---
   num_envs: int = 16            # K; must be >= number of training tasks
   ema: float = 0.99             # beta_ema
   tau_resp: float = 0.25        # temperature on the skill-score error
   nmin: int = 256               # N_min, cumulative activation burn-in
+  stats_routing: str = 'clean'  # 'clean' (revised) | 'train' (legacy)
 
   # --- Residual invariance ---
   maxsig: int = 32              # residuals sampled per (env, expert)
@@ -111,15 +146,25 @@ class MoSSRSSM(nj.Module):
   bandwidths: tuple = (0.5, 1.0, 2.0, 4.0)
   warm_steps: int = 5000        # T_warm
   ramp_steps: int = 5000        # T_ramp
-  bal_impl: str = 'paper'       # 'paper' (soft mass) or 'switch'
+  mmd_weights: str = 'routed'   # 'routed' (pi~, revised) | 'uniform' (legacy)
+  sub_norm: str = 'running'     # 'running' (revised) | 'batch' (legacy)
+  bal_impl: str = 'paper'       # legacy L_bal: 'paper' (soft mass) | 'switch'
 
   # --- Offline uncertainty penalty (read by the agent) ---
   beta_unc: float = 1.0
   unc_quantile: float = 95.0
+  dis_impl: str = 'equal'       # 'equal' (revised) | 'routed' (legacy)
+  dbar_calib: int = 1000        # policy updates re-estimating d_bar; 0: off
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
     assert 1 <= self.topk <= self.experts
+    assert self.noise_impl in ('select', 'learned'), self.noise_impl
+    assert self.sep_impl in ('hinge', 'plain'), self.sep_impl
+    assert self.stats_routing in ('clean', 'train'), self.stats_routing
+    assert self.mmd_weights in ('routed', 'uniform'), self.mmd_weights
+    assert self.sub_norm in ('running', 'batch'), self.sub_norm
+    assert self.dis_impl in ('equal', 'routed'), self.dis_impl
     self.act_space = act_space
     self.kw = kw
     K, M = self.num_envs, self.experts
@@ -130,6 +175,12 @@ class MoSSRSSM(nj.Module):
     self.eseen = nj.Variable(jnp.zeros, (K,), f32, name='eseen')
     self.dbar = nj.Variable(jnp.zeros, (K,), f32, name='dbar')
     self.step = nj.Variable(jnp.zeros, (), f32, name='step')
+    # Revised statistics.
+    self.tau_route = nj.Variable(jnp.zeros, (), f32, name='tau_route')
+    self.wbar = nj.Variable(jnp.zeros, (), f32, name='wbar')
+    self.dsum = nj.Variable(jnp.zeros, (K,), f32, name='dsum')
+    self.dcnt = nj.Variable(jnp.zeros, (K,), f32, name='dcnt')
+    self.cstep = nj.Variable(jnp.zeros, (), f32, name='cstep')
 
   # ------------------------------------------------------------------ API
 
@@ -196,8 +247,13 @@ class MoSSRSSM(nj.Module):
 
     dis: (N, H) disagreement along imagined rollouts; env: (N,) start env.
     Zero for disagreement typical of the recorded data of that environment.
+    Uses the frozen-model estimate of d_bar once it exists (dbar_calib), else
+    the moving average from world-model training.
     """
-    dbar = sg(self.dbar.read())[env.astype(i32)]          # (N,)
+    dcnt = sg(self.dcnt.read())
+    calib = sg(self.dsum.read()) / jnp.maximum(dcnt, 1.0)
+    dbar = jnp.where(dcnt > 0, calib, sg(self.dbar.read()))
+    dbar = dbar[env.astype(i32)]                            # (N,)
     valid = (dbar > 0)[:, None]
     ratio = f32(dis) / jnp.where(valid, dbar[:, None], 1.0)
     return self.beta_unc * jnp.where(valid, jnp.maximum(0.0, ratio - 1.0), 0.0)
@@ -209,6 +265,7 @@ class MoSSRSSM(nj.Module):
     feat = dict(
         deter=deter, stoch=stoch, logit=logit,
         pi=ex['pi'], pitilde=ex['pitilde'], delta=ex['delta'],
+        rlogit=ex['rlogit'], cpi=ex['cpi'], cdelta=ex['cdelta'],
         zexp=ex['zexp'], dis=ex['dis'],
         klexp=klexp, klpers=klpers)
     if self.expert_heads:
@@ -247,22 +304,36 @@ class MoSSRSSM(nj.Module):
     klpers = post.kl(self._dist(self._prior(sg(prev))))
     return f32(klexp), f32(klpers)
 
+  def _noise_sigma(self):
+    return moss_math.linear_anneal(
+        self.step.read(), self.noise_scale, self.noise_steps)
+
   def _router(self, x, noise):
-    logits = self.sub('rlogit', nn.Linear, self.experts, **self.kw)(x)
+    """Returns the training routing (pi, pitilde, delta) and the noise-free
+    routing (rlogit, cpi, cdelta). With noise_impl 'select' the noise only
+    changes which experts are selected; pi is the clean softmax, so a given
+    selection gets the same weights as in imagination."""
+    logits = f32(self.sub('rlogit', nn.Linear, self.experts, **self.kw)(x))
+    cpi = jax.nn.softmax(logits, -1)
+    cdelta = moss_math.topk_mask(logits, self.topk)
+    pi, select = cpi, logits
     if self.router_noise and noise:
-      scale = jax.nn.softplus(
-          self.sub('rnoise', nn.Linear, self.experts, **self.kw)(x))
-      eps = jax.random.normal(nj.seed(), logits.shape, logits.dtype)
-      logits = logits + eps * scale
-    pi = jax.nn.softmax(f32(logits), -1)
-    _, idx = jax.lax.top_k(f32(logits), self.topk)
-    delta = jax.nn.one_hot(idx, self.experts, dtype=f32).sum(-2)
+      eps = jax.random.normal(nj.seed(), logits.shape, f32)
+      if self.noise_impl == 'learned':
+        # Legacy: learned noise on the logits, which also moves the weights.
+        scale = f32(jax.nn.softplus(
+            self.sub('rnoise', nn.Linear, self.experts, **self.kw)(x)))
+        select = logits + eps * scale
+        pi = jax.nn.softmax(select, -1)
+      else:
+        select = logits + eps * self._noise_sigma()
+    delta = moss_math.topk_mask(select, self.topk)
     if self.dense_warmup:
       dense = (self.step.read() < self.warm_steps).astype(f32)
       delta = dense + (1 - dense) * delta
-    masked = pi * delta
-    pitilde = masked / jnp.maximum(masked.sum(-1, keepdims=True), 1e-8)
-    return pi, pitilde, delta
+    pitilde = moss_math.renorm(pi, delta)
+    return dict(pi=pi, pitilde=pitilde, delta=delta,
+                rlogit=logits, cpi=cpi, cdelta=cdelta)
 
   def _stem(self, deter, stoch, action):
     """Shared input projections of (h_{t-1}, z_{t-1}, a_{t-1})."""
@@ -297,19 +368,26 @@ class MoSSRSSM(nj.Module):
     return z, update * cand + (1 - update) * deter
 
   def _core(self, deter, stoch, action, noise):
-    """Routed recurrent update. Each expert owns its own block-GRU."""
+    """Routed recurrent update. Each expert owns its own block-GRU.
+
+    All M experts are evaluated (dense compute); the router only decides how
+    they are mixed. This is what makes the dense part of L_comp free."""
     shared, action = self._stem(deter, stoch, action)
-    pi, pitilde, delta = self._router(sg(shared), noise)
+    r = self._router(sg(shared), noise)
     zexps, deters = zip(*[
         self._expert(m, shared, deter) for m in range(self.experts)])
     deters = list(deters)
     stacked = jnp.stack(deters, -2)                          # (B, M, D)
-    routed = (nn.cast(pitilde)[..., None] * stacked).sum(-2)
-    # Co-active disagreement (Eq. 28): weighted spread of candidates.
-    spread = jnp.square(f32(stacked) - f32(routed)[..., None, :]).mean(-1)
-    dis = (pitilde * spread).sum(-1)                         # (B,)
-    ex = dict(pi=pi, pitilde=pitilde, delta=delta, deters=deters,
-              zexp=jnp.stack(zexps, -2), dis=dis, shared=shared)
+    routed = (nn.cast(r['pitilde'])[..., None] * stacked).sum(-2)
+    # Co-active disagreement (Eq. 28). 'equal': the noise-free active set,
+    # weighted equally, so it measures disagreement, not router confidence,
+    # and matches the routing used in imagination.
+    if self.dis_impl == 'equal':
+      dis = moss_math.disagreement(stacked, r['cdelta'])
+    else:
+      dis = moss_math.disagreement(stacked, r['delta'], r['pitilde'])
+    ex = dict(r, deters=deters, zexp=jnp.stack(zexps, -2), dis=dis,
+              shared=shared)
     if self.expert_heads:
       inp = jnp.concatenate(
           [ex['zexp'], action[..., None, :].repeat(self.experts, -2)], -1)
@@ -363,10 +441,31 @@ class MoSSRSSM(nj.Module):
     s = self.step.read()
     return jnp.clip((s - self.warm_steps) / max(self.ramp_steps, 1), 0.0, 1.0)
 
+  def _sync_axes(self, sync):
+    return internal.get_data_axes() if sync else None
+
+  def _route_tau(self, klexp, delta, training):
+    """tau of L_comp: moving average of the mean active-expert KL, so the
+    competitive weights exp(-KL / tau) do not depend on the KL scale."""
+    mean = (delta * klexp).sum() / jnp.maximum(delta.sum(), 1.0)
+    old = self.tau_route.read()
+    if training:
+      axes = self._sync_axes(True)
+      if axes:
+        mean = jax.lax.psum(mean, axes) / jax.lax.psum(1.0, axes)
+      new = jnp.where(old > 0, self.ema * old + (1 - self.ema) * mean, mean)
+      self.tau_route.write(sg(new))
+      old = new
+    tau = jnp.where(old > 0, old, mean)
+    return sg(jnp.maximum(tau, 1e-3))
+
   # ----------------------------------------------------------------- loss
 
   def loss(self, carry, tokens, acts, reset, training,
-           task_id=None, reward=None, cont=None):
+           task_id=None, reward=None, cont=None, calib=False):
+    """`training`: world-model update (statistics and step advance).
+    `calib`: policy-phase update on the frozen model; only re-estimates
+    d_bar for the uncertainty penalty (dbar_calib)."""
     metrics = {}
     carry, entries, feat, ext = self.observe(
         carry, tokens, acts, reset, training, extra=True)
@@ -386,6 +485,10 @@ class MoSSRSSM(nj.Module):
     pi = f32(feat['pi'])
     pit = f32(feat['pitilde'])
     delta = f32(feat['delta'])
+    rlogit = f32(feat['rlogit'])
+    cpi = f32(feat['cpi'])
+    cdelta = f32(feat['cdelta'])
+    cpit = moss_math.renorm(cpi, cdelta)
     klexp = f32(feat['klexp'])
 
     # L_exp: every active expert is a complete predictor (free nats as L_dyn).
@@ -398,22 +501,31 @@ class MoSSRSSM(nj.Module):
       chat = (pit * f32(feat['cexp'])).sum(-1)
       losses['mcon'] = _bce_logits(chat, f32(cont))
 
-    # L_sp: routing mass on the active set (Eq. 24), compatible with k >= 2.
+    # L_comp: competitive router loss on the clean logits (router only; the
+    # router input is detached in _core and the KLs are detached here).
+    tau = self._route_tau(klexp, delta, training)
+    comp = moss_math.competitive_router_loss(rlogit, delta, klexp, tau)
+    if self.comp_dense:
+      comp = comp + moss_math.competitive_router_loss(
+          rlogit, jnp.ones_like(delta), klexp, tau)
+    losses['mcomp'] = comp
+
+    # L_z: bounds the scale of the linear router logits.
+    losses['mz'] = moss_math.router_z_loss(rlogit)
+
+    # Legacy router regularizers (scale 0 in the revised defaults).
     losses['msp'] = 1.0 - (pi * delta).sum(-1)
     pbar = pi.mean((0, 1))
     if self.bal_impl == 'switch':
-      fbar = delta.mean((0, 1)) * (M / max(self.topk, 1))
+      fbar = delta.mean((0, 1)) / max(self.topk, 1)
       bal = M * (fbar * pbar).sum()
     else:
       bal = jnp.square(pbar - 1.0 / M).sum()
     losses['mbal'] = jnp.broadcast_to(bal, (B, T))
 
-    # L_div on masked expert features.
     z = f32(feat['zexp']) * delta[..., None]
     z = z.reshape((B * T, M, self.zdim)).transpose((1, 0, 2))
-    z = z / (jnp.linalg.norm(z, axis=(1, 2), keepdims=True) + 1e-8)
-    # No 1/|B|: Z-bar is already Frobenius-normalized, so the extra factor
-    # made L_div ~1e-7 and scale as 1/|B|^2. Now batch-invariant in [0, 1].
+    z = z / jnp.sqrt(jnp.sum(z * z, axis=(1, 2), keepdims=True) + 1e-12)
     gram = jnp.einsum('mnd,pne->mpde', z, z)
     off = 1.0 - jnp.eye(M)
     div = (jnp.square(gram).sum((-1, -2)) * off).sum() / max(M * (M - 1), 1)
@@ -423,16 +535,48 @@ class MoSSRSSM(nj.Module):
     if task_id is None:
       losses['msub'] = jnp.zeros((B, T), f32)
     else:
+      clean = self.stats_routing == 'clean'
       flat = lambda x: x.reshape((B * T, *x.shape[2:]))
       sub, rmets = self._subset_loss(
           task_id.reshape(-1).astype(i32),
           delta.reshape((-1, M)), pit.reshape((-1, M)),
+          (cdelta if clean else delta).reshape((-1, M)),
+          (cpit if clean else pit).reshape((-1, M)),
           klexp.reshape((-1, M)), f32(feat['klpers']).reshape(-1),
           f32(feat['dis']).reshape(-1),
           flat(feat['deter']), flat(feat['stoch']),
-          flat(ext['shared']), flat(ext['prev']), training)
+          flat(ext['shared']), flat(ext['prev']), training, calib)
       losses['msub'] = jnp.broadcast_to(lam * sub, (B, T))
       metrics.update(rmets)
+
+    # L_sep. 'hinge': -H(E) + sum_g P(g)[H(E|g) - log s]_+ on the clean
+    # softmax masked to the noise-free active set, s >= k. 'plain': the
+    # earlier -I(task; expert) on the full (training) softmax.
+    if task_id is None:
+      losses['msep'] = jnp.zeros((B, T), f32)
+    else:
+      sums, cnt, rmets = self._route_mass(pi, task_id, training)
+      mi, he, heg = moss_math.route_mi(sums, cnt)
+      if self.sep_impl == 'plain':
+        sep = -mi / min(np.log(self.num_envs), np.log(M))
+      else:
+        usums, ucnt = self._task_sums(cpi * cdelta, task_id, training)
+        target = self.sep_target or float(self.topk)
+        sep, she, sheg = moss_math.hinged_route_mi(usums, ucnt, target)
+        sep = sep / np.log(M)
+        metrics['moss_sep_HE_active'] = she
+        metrics['moss_sep_HEG_active'] = sheg
+      lam_sep = moss_math.ramp(self.step.read(), self.warm_steps) \
+          if self.sep_ramp else 1.0
+      losses['msep'] = jnp.broadcast_to(lam_sep * sep, (B, T))
+      present = (cnt > 0).sum()
+      metrics.update(rmets)
+      metrics['moss_sep_mi'] = mi
+      metrics['moss_sep_mi_norm'] = mi / jnp.minimum(
+          jnp.log(jnp.maximum(present, 2).astype(f32)), np.log(M))
+      metrics['moss_route_HE'] = he
+      metrics['moss_route_HEG'] = heg
+      metrics['moss_sep_lambda'] = lam_sep
 
     if training:
       self.step.write(self.step.read() + 1.0)
@@ -440,46 +584,93 @@ class MoSSRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['moss_usage'] = delta.mean()
+    # Collapse monitors.
+    load = delta.mean((0, 1)) / max(self.topk, 1)            # sums to 1
+    metrics['moss_load_max'] = load.max()
+    metrics['moss_dead_experts'] = (load == 0).astype(f32).sum()
+    metrics['moss_eff_experts'] = jnp.exp(
+        -(load * jnp.log(load + 1e-12)).sum())               # 1..M
     metrics['moss_active_mass'] = (pi * delta).sum(-1).mean()
+    # Effective number of active experts per transition under the clean
+    # routing (1..k); near 1 means k >= 2 has collapsed to top-1.
+    metrics['moss_eff_active'] = jnp.exp(
+        -(cpit * jnp.log(cpit + 1e-12)).sum(-1)).mean()
+    # Fraction of transitions whose training selection equals the noise-free
+    # selection; 1 once sigma(s) = 0.
+    metrics['moss_select_agree'] = (delta == cdelta).all(-1).astype(f32).mean()
+    metrics['moss_noise_sigma'] = self._noise_sigma() \
+        if self.noise_impl == 'select' else jnp.zeros((), f32)
+    metrics['moss_comp'] = comp.mean()
+    metrics['moss_tau_route'] = tau
+    metrics['moss_router_lse'] = jax.nn.logsumexp(rlogit, -1).mean()
     metrics['moss_lambda'] = lam
     metrics['moss_dis'] = f32(feat['dis']).mean()
     return carry, entries, losses, feat, metrics
 
-  def _subset_loss(self, env, delta, pit, klexp, klpers, dis,
-                   deter, stoch, shared, prev, training):
+  def _task_sums(self, mass, task_id, training):
+    """Per-task sums of a (B, T, M) routing mass, (K, M), and counts (K,)."""
+    K, M = self.num_envs, self.experts
+    onehot = jax.nn.one_hot(task_id.reshape(-1).astype(i32), K, dtype=f32)
+    sums = jnp.einsum('nk,nm->km', onehot, mass.reshape((-1, M)))  # (K, M)
+    cnt = onehot.sum(0)                                            # (K,)
+    axes = self._sync_axes(training)
+    if axes:
+      sums, cnt = jax.lax.psum((sums, cnt), axes)
+    return sums, cnt
+
+  def _route_mass(self, pi, task_id, training):
+    """Per-task sums of the soft router mass (K, M) and counts (K,).
+
+    Also returned as scalar metrics, logged as sums so the train loop can pool
+    them over a log interval and divide once
+    (embodied/run/train_offline.py:route_mass).
+    """
+    K, M = self.num_envs, self.experts
+    mass, cnt = self._task_sums(pi, task_id, training)
+    mets = {}
+    for k in range(K):
+      mets[f'moss_route_cnt/t{k:02d}'] = cnt[k]
+      for m in range(M):
+        mets[f'moss_route_sum/t{k:02d}/e{m}'] = mass[k, m]
+    return mass, cnt, mets
+
+  def _subset_loss(self, env, delta, pit, sdelta, spit, klexp, klpers, dis,
+                   deter, stoch, shared, prev, training, calib):
+    """delta/pit: training routing (the routed prior used for the residuals).
+    sdelta/spit: routing for the responsibility statistics ('clean': the
+    noise-free active set, as used in imagination)."""
     K, M, S = self.num_envs, self.experts, self.maxsig
     N, D = env.shape[0], self.stoch
     onehot = jax.nn.one_hot(env, K, dtype=f32)              # (N, K)
     envcnt = onehot.sum(0)
 
     # ---- Minibatch statistics (Eqs. 7-8).
-    aw = delta * pit
+    aw = sdelta * spit
     q_b = jnp.einsum('nk,nm->km', onehot, aw) / jnp.maximum(envcnt[:, None], 1)
     num = jnp.einsum('nk,nm->km', onehot, aw * klexp)
     den = jnp.einsum('nk,nm->km', onehot, aw * klpers[:, None])
     l_b = num / (den + 1e-6)                                # skill score
-    supp = jnp.einsum('nk,nm->km', onehot, delta)
-    dis_e = jnp.nanpercentile(
-        jnp.where(onehot > 0, dis[:, None], jnp.nan), self.unc_quantile, 0)
-    dis_e = jnp.nan_to_num(dis_e)
+    supp = jnp.einsum('nk,nm->km', onehot, sdelta)
+    dis_e = _masked_percentile(dis, onehot, self.unc_quantile)  # (K,)
     present = envcnt > 0
 
+    axes = self._sync_axes(training or calib)
+    if axes:
+      npres = jax.lax.psum(f32(present), axes)
+      q_b = jax.lax.psum(q_b * present[:, None], axes) / jnp.maximum(
+          npres[:, None], 1)
+      dis_e = jax.lax.psum(dis_e * present, axes) / jnp.maximum(npres, 1)
+      seenm = jax.lax.psum(f32(supp > 0), axes)
+      l_b = jax.lax.psum(l_b * (supp > 0), axes) / jnp.maximum(seenm, 1)
+      supp = jax.lax.psum(supp, axes)
+      present = npres > 0
+
+    b = self.ema
+    ema = lambda old, new, first: jnp.where(first, new, b * old + (1 - b) * new)
     if training:
-      axes = internal.get_data_axes()
-      if axes:
-        npres = jax.lax.psum(f32(present), axes)
-        q_b = jax.lax.psum(q_b * present[:, None], axes) / jnp.maximum(
-            npres[:, None], 1)
-        dis_e = jax.lax.psum(dis_e * present, axes) / jnp.maximum(npres, 1)
-        seenm = jax.lax.psum(f32(supp > 0), axes)
-        l_b = jax.lax.psum(l_b * (supp > 0), axes) / jnp.maximum(seenm, 1)
-        supp = jax.lax.psum(supp, axes)
-        present = npres > 0
-      b = self.ema
       first_env = self.eseen.read() == 0
       first_em = self.count.read() == 0
       seen = supp > 0
-      ema = lambda old, new, first: jnp.where(first, new, b * old + (1 - b) * new)
       # Usage: updated whenever the env is present; first update sets it.
       self.q_ema.write(sg(jnp.where(
           present[:, None],
@@ -493,6 +684,15 @@ class MoSSRSSM(nj.Module):
       self.count.write(sg(self.count.read() + supp))
       self.eseen.write(sg(self.eseen.read() + f32(present)))
 
+    if calib and self.dbar_calib > 0:
+      # Frozen model, noise-free routing: average the per-batch percentile
+      # over the first dbar_calib policy updates (paper: d_bar computed once
+      # with the frozen model on the recorded transitions).
+      on = f32(self.cstep.read() < self.dbar_calib)
+      self.dsum.write(sg(self.dsum.read() + on * dis_e * f32(present)))
+      self.dcnt.write(sg(self.dcnt.read() + on * f32(present)))
+      self.cstep.write(sg(self.cstep.read() + 1.0))
+
     q, l, cnt = [sg(v.read()) for v in (self.q_ema, self.l_ema, self.count)]
 
     # ---- Responsibility (Eq. 9), computed as a stable softmax over experts.
@@ -503,7 +703,10 @@ class MoSSRSSM(nj.Module):
     a = jnp.sqrt(rho[:, None, :] * rho[None, :, :] + 1e-12)
     a = sg(a * chi[:, None, :] * chi[None, :, :])           # (K, K, M)
 
-    # ---- Residual-invariance MMD per expert (U-statistic, Eqs. 13-14).
+    # ---- Residual-invariance MMD per expert (weighted U-statistic).
+    # Residuals are sampled uniformly among the transitions where expert m is
+    # active in the training routing (the routed prior they are computed
+    # under) and weighted by pi~ in the MMD ('routed').
     key = jax.random.uniform(nj.seed(), (N,))
     scale = [2.0 * bw * bw * D / 12.0 for bw in self.bandwidths]
     mmds, oks = [], []
@@ -512,35 +715,51 @@ class MoSSRSSM(nj.Module):
       val, idx = jax.lax.top_k(score.T, S)                   # (K, S)
       valid = f32(val > 0)
       ok = f32(valid.sum(-1) >= self.nsig)                    # (K,)
+      idx = idx.reshape(-1)
       w = valid.reshape(-1) * jnp.repeat(ok, S)
-      x = self._pit_residual(
-          m, idx.reshape(-1), deter, stoch, shared, prev, pit)
+      if self.mmd_weights == 'routed':
+        w = w * sg(pit[idx, m])
+      x = self._pit_residual(m, idx, deter, stoch, shared, prev, pit)
       sq = jnp.sum(x * x, -1)
       d2 = jnp.maximum(sq[:, None] + sq[None, :] - 2 * x @ x.T, 0.0)
       kmat = sum(jnp.exp(-d2 / s) for s in scale) / len(scale)
-      Wm = jnp.repeat(jnp.eye(K), S, axis=0) * w[:, None]    # (K*S, K)
-      Ssum = Wm.T @ kmat @ Wm
-      n = Wm.sum(0)
-      within = (jnp.diag(Ssum) - n) / jnp.maximum(n * (n - 1), 1.0)
-      cross = Ssum / jnp.maximum(n[:, None] * n[None, :], 1.0)
-      mmds.append(within[:, None] + within[None, :] - 2 * cross)
+      mmds.append(moss_math.block_mmd(kmat, w, K, S))
       oks.append(ok)
     mmd = jnp.stack(mmds, -1)                                 # (K, K, M)
     okm = jnp.stack(oks, -1)
     tri = jnp.triu(jnp.ones((K, K)), 1)[..., None]
     w_ij = a * okm[:, None, :] * okm[None, :, :] * tri        # Eq. 11
-    loss = (w_ij * mmd).sum() / (w_ij.sum() + 1e-8)           # Eq. 15
+    total = w_ij.sum()
+    numer = (w_ij * mmd).sum()
+    if self.sub_norm == 'running':
+      wbar = self.wbar.read()
+      if training:
+        tot = total
+        if axes:
+          tot = jax.lax.psum(tot, axes) / jax.lax.psum(1.0, axes)
+        # Initialized at its first nonzero value, updated before use.
+        wbar = jnp.where(wbar > 0, b * wbar + (1 - b) * tot, tot)
+        self.wbar.write(sg(wbar))
+      denom = jnp.where(wbar > 0, wbar, total)
+      loss = numer / (sg(denom) + 1e-8)
+    else:
+      loss = numer / (total + 1e-8)                           # Eq. 15
 
     seen_l = cnt > 0
+    dcnt = self.dcnt.read()
     mets = {
         'moss_rho_max': rho.max(-1).mean(),
         'moss_rho_ent': -(rho * jnp.log(rho + 1e-8)).sum(-1).mean(),
         'moss_pairs': (w_ij > 0).astype(f32).sum(),
         'moss_mmd_weighted': loss,
+        'moss_wbar': self.wbar.read(),
         'moss_support': chi.mean(),
         'moss_skill': (l * seen_l).sum() / jnp.maximum(seen_l.sum(), 1),
         'moss_dbar': (self.dbar.read() * (self.eseen.read() > 0)).sum()
                      / jnp.maximum((self.eseen.read() > 0).sum(), 1),
+        'moss_dbar_calib': (
+            self.dsum.read() / jnp.maximum(dcnt, 1) * (dcnt > 0)).sum()
+            / jnp.maximum((dcnt > 0).sum(), 1),
     }
     return loss, mets
 
@@ -548,3 +767,22 @@ class MoSSRSSM(nj.Module):
 def _bce_logits(logit, target):
   return jnp.maximum(logit, 0) - logit * target + jnp.log1p(
       jnp.exp(-jnp.abs(logit)))
+
+
+def _masked_percentile(x, mask, q):
+  """Per-column linear-interpolated percentile of x over rows where mask > 0.
+
+  NaN-free on purpose (masked rows get a large finite sentinel, not NaN), so
+  jax.debug_nans does not fire on it. Columns with no rows return 0.
+  x: (N,), mask: (N, K) -> (K,)
+  """
+  n = mask.sum(0)                                             # (K,)
+  vals = jnp.where(mask > 0, x[:, None], 1e30)
+  srt = jnp.sort(vals, axis=0)                                # valid rows first
+  pos = (q / 100.0) * jnp.maximum(n - 1, 0)
+  lo = jnp.floor(pos).astype(i32)
+  hi = jnp.minimum(lo + 1, jnp.maximum(n - 1, 0).astype(i32))
+  frac = pos - lo
+  vlo = jnp.take_along_axis(srt, lo[None, :], 0)[0]
+  vhi = jnp.take_along_axis(srt, hi[None, :], 0)[0]
+  return jnp.where(n > 0, vlo + frac * (vhi - vlo), 0.0)
